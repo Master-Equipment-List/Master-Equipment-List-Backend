@@ -8,11 +8,18 @@ from sqlalchemy.ext.asyncio import (
 
 from app.config import settings
 
+# asyncpg needs SSL passed as a driver kwarg, not via the URL string.
+# Hosted Postgres (Render, Heroku, RDS) requires it; localhost rarely does.
+_connect_args: dict[str, object] = {}
+if settings.DB_SSL:
+    _connect_args["ssl"] = True
+
 engine = create_async_engine(
     settings.database_url,
     echo=settings.DB_ECHO,
     pool_pre_ping=True,
     future=True,
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(

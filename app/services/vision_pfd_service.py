@@ -19,12 +19,16 @@ import io
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from app.config import settings
 
 log = logging.getLogger(__name__)
+
+# Re-export the shared singleton so callers can still call _get_client().
+from app.services._shared_client import get_anthropic_client as _get_client  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +101,27 @@ def _render_pages(pdf_path: str | Path, max_pages: int, dpi: int) -> list:
     return convert_from_path(str(pdf_path), dpi=dpi, **kwargs)
 
 
+# Anthropic's vision API rejects images with any dimension > 8000 px.
+# A1 landscape engineering drawings at 400 DPI go to ~9300 × 6600 — well
+# over that limit on the long edge. We pre-resize to fit so the call
+# doesn't 400. The model resizes its input internally anyway (long edge
+# clamped to ~1568 px), so capping at MAX_IMAGE_DIM doesn't lose
+# information that wasn't going to be used.
+MAX_IMAGE_DIM = 7800  # leave a small safety margin under 8000
+
+
 def _image_to_b64(img) -> str:
+    # Defensive downscale: if either dimension exceeds the API cap,
+    # shrink proportionally before encoding.
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_DIM:
+        scale = MAX_IMAGE_DIM / float(max(w, h))
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        try:
+            from PIL import Image  # local import — Image already loaded via pdf2image
+            img = img.resize(new_size, Image.LANCZOS)
+        except Exception:
+            img = img.resize(new_size)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
@@ -148,19 +172,16 @@ def _tile_image(img, cols: int, rows: int, overlap_frac: float = 0.04) -> list:
 
 
 def _call_claude_on_image(img, label: str) -> dict[str, Any]:
-    """Send a SINGLE image to Claude with the generic prompt. Each call has
-    a small, focused output that fits comfortably in max_tokens — so dense
-    pages (vendor data sheets, equipment headers) don't get truncated.
+    """Send a SINGLE image to Claude with the generic prompt.
 
     Always returns a dict — never None — so the caller can record failures
     in the page output instead of silently losing content.
     """
     try:
-        from anthropic import Anthropic
-    except ImportError:
+        client = _get_client()
+    except RuntimeError:
         return {"_label": label, "_extraction_error": "anthropic_sdk_missing"}
 
-    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     image_block = {
         "type": "image",
         "source": {
@@ -207,34 +228,45 @@ def _call_claude_on_image(img, label: str) -> dict[str, Any]:
 
 
 def _call_claude_on_page(img) -> dict[str, Any]:
-    """Robust per-page extraction. We make ONE Claude call per image:
-       - The full-page overview (for layout context).
-       - Each tile of the geometric grid (for small-text legibility).
+    """Parallel per-page extraction — overview + all tiles fire concurrently.
 
-    Every image becomes a separate API call with its own JSON output. This
-    guarantees: (a) no single response can truncate and lose the whole page,
-    and (b) a failure on any one tile is recorded but doesn't drop the rest.
+    Each image is a separate Claude call with its own JSON output so a
+    failure on one tile is recorded without dropping the rest. Running them
+    in a ThreadPoolExecutor turns what was N serial API round-trips into a
+    single wall-clock wait equal to the slowest call.
     """
     cols = max(1, settings.VISION_TILE_COLS)
     rows = max(1, settings.VISION_TILE_ROWS)
 
-    page_result: dict[str, Any] = {}
-
-    # Overview — sees the whole page, picks up large items (title block,
-    # overall layout, big labels) without small-text precision.
-    page_result["overview"] = _call_claude_on_image(img, label="overview")
-
-    # Tiles — each is a high-resolution slice. The grid is mechanical, no
-    # assumption about what's in each cell.
+    # Build the work list: (label, image) pairs.
+    tasks: list[tuple[str, Any]] = [("overview", img)]
     if cols * rows > 1:
-        tiles = _tile_image(img, cols, rows)
-        tile_results: list[dict[str, Any]] = []
-        for idx, tile in enumerate(tiles):
+        for idx, tile in enumerate(_tile_image(img, cols, rows)):
             r, c = divmod(idx, cols)
-            label = f"tile_r{r}_c{c}"
-            tile_results.append(_call_claude_on_image(tile, label=label))
-        page_result["tiles"] = tile_results
+            tasks.append((f"tile_r{r}_c{c}", tile))
 
+    # Fire all calls concurrently — Anthropic SDK is synchronous so we use
+    # threads. Max workers = number of tasks so they all start immediately.
+    results: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        future_to_label = {
+            pool.submit(_call_claude_on_image, tile_img, label): label
+            for label, tile_img in tasks
+        }
+        for future in as_completed(future_to_label):
+            label = future_to_label[future]
+            try:
+                results[label] = future.result()
+            except Exception as e:  # noqa: BLE001
+                results[label] = {"_label": label, "_extraction_error": str(e)}
+
+    page_result: dict[str, Any] = {"overview": results["overview"]}
+    if cols * rows > 1:
+        page_result["tiles"] = [
+            results[f"tile_r{r}_c{c}"]
+            for r in range(rows)
+            for c in range(cols)
+        ]
     return page_result
 
 
@@ -262,13 +294,26 @@ def extract(pdf_path: str | Path) -> dict[str, Any] | None:
     if not pages:
         return None
 
-    page_results: list[dict[str, Any]] = []
-    for page_idx, img in enumerate(pages, start=1):
-        result = _call_claude_on_page(img)
-        # Tag every page with its 1-based index so downstream consumers
-        # know which page they're looking at.
-        result["_page_index"] = page_idx
-        page_results.append(result)
+    # Process pages concurrently — each page's tiles are already parallelised
+    # inside _call_claude_on_page; this outer pool lets multiple pages run at
+    # the same time. Cap at 2: each page already fans out to 7 tile calls, so
+    # 2 pages × 7 tiles = 14 concurrent API calls — safely within rate limits
+    # even when several files are synced in parallel.
+    page_results: list[dict[str, Any]] = [{}] * len(pages)
+    max_page_workers = min(len(pages), 2)
+    with ThreadPoolExecutor(max_workers=max_page_workers) as pool:
+        future_to_idx = {
+            pool.submit(_call_claude_on_page, img): page_idx
+            for page_idx, img in enumerate(pages, start=1)
+        }
+        for future in as_completed(future_to_idx):
+            page_idx = future_to_idx[future]
+            try:
+                result = future.result()
+            except Exception as e:  # noqa: BLE001
+                result = {"_extraction_error": str(e)}
+            result["_page_index"] = page_idx
+            page_results[page_idx - 1] = result
 
     return {"pages": page_results} if page_results else None
 

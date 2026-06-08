@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     DB_PASSWORD: str = "postgres"
     DB_NAME: str = "mel_db"
     DB_ECHO: bool = False
+    # Set DB_SSL=true for hosted Postgres providers (Render, Heroku, RDS w/ SSL).
+    # asyncpg understands ?ssl=true; psycopg2 understands ?sslmode=require.
+    DB_SSL: bool = False
 
     JWT_SECRET_KEY: str = "change-me"
     JWT_ALGORITHM: str = "HS256"
@@ -87,6 +90,8 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
+        # asyncpg does NOT accept ssl-mode params on the URL — we pass
+        # ssl=True via connect_args in session.py when DB_SSL is true.
         return (
             f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
@@ -94,9 +99,10 @@ class Settings(BaseSettings):
 
     @property
     def database_url_sync(self) -> str:
+        suffix = "?sslmode=require" if self.DB_SSL else ""
         return (
             f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}"
-            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}{suffix}"
         )
 
     @property

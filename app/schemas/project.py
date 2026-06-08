@@ -27,6 +27,13 @@ class ProjectUpdate(BaseModel):
     onedrive_root_path: str | None = None
     onedrive_drive_id: str | None = None
     onedrive_root_item_id: str | None = None
+    # Per-workspace OneDrive overrides
+    topside_onedrive_root_path: str | None = None
+    topside_onedrive_drive_id: str | None = None
+    topside_onedrive_root_item_id: str | None = None
+    marine_onedrive_root_path: str | None = None
+    marine_onedrive_drive_id: str | None = None
+    marine_onedrive_root_item_id: str | None = None
 
 
 class ProjectOut(BaseModel):
@@ -40,9 +47,17 @@ class ProjectOut(BaseModel):
     client: str | None
     facility: str | None
     location: str | None
+    # Legacy single-root columns
     onedrive_root_path: str | None
     onedrive_drive_id: str | None
     onedrive_root_item_id: str | None
+    # Per-workspace OneDrive roots
+    topside_onedrive_root_path: str | None = None
+    topside_onedrive_drive_id: str | None = None
+    topside_onedrive_root_item_id: str | None = None
+    marine_onedrive_root_path: str | None = None
+    marine_onedrive_drive_id: str | None = None
+    marine_onedrive_root_item_id: str | None = None
     created_by_id: int | None
     created_at: datetime
     updated_at: datetime

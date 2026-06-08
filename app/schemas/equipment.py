@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class EquipmentBase(BaseModel):
+    workspace: str = "topside"  # "topside" | "marine"
     rev_no: str | None = None
     old_tag: str | None = None
     client_tag: str
@@ -37,6 +38,7 @@ class EquipmentBase(BaseModel):
     remarks: str | None = None
     total_dry_weight_mt: str | None = None
     total_operating_weight_mt: str | None = None
+    lifecycle_status: str | None = None
 
 
 class EquipmentCreate(EquipmentBase):
@@ -75,6 +77,7 @@ class EquipmentUpdate(BaseModel):
     remarks: str | None = None
     total_dry_weight_mt: str | None = None
     total_operating_weight_mt: str | None = None
+    lifecycle_status: str | None = None
     data: dict[str, Any] | None = None
     note: str | None = None
 

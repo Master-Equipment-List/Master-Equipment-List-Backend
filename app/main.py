@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.admin import setup_admin
 from app.api.v1.router import api_router
 from app.config import settings
 
@@ -31,6 +32,9 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(api_router, prefix=settings.API_PREFIX)
+
+    # Database browser for superusers, at /admin.
+    setup_admin(app)
 
     @app.get("/", include_in_schema=False)
     async def root():

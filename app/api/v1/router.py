@@ -1,6 +1,15 @@
 from fastapi import APIRouter
 
-from app.api.v1 import auth, equipment, files, onedrive, projects, sync, users, versions
+from app.api.v1 import (
+    auth,
+    equipment,
+    files,
+    onedrive,
+    projects,
+    sync,
+    users,
+    versions,
+)
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])

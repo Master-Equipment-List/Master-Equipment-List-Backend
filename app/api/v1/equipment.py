@@ -26,12 +26,15 @@ async def list_equipment(
     db: DbSession,
     project: Project = Depends(project_access("viewer")),
     q: str | None = Query(None, description="Search by client tag, old tag, or description."),
+    workspace: str | None = Query(None, description="Filter by workspace: 'topside' or 'marine'. Omit to return all."),
     module: str | None = None,
     equipment_type: str | None = None,
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
 ):
     stmt = select(Equipment).where(Equipment.project_id == project.id)
+    if workspace:
+        stmt = stmt.where(Equipment.workspace == workspace)
     if q:
         like = f"%{q}%"
         stmt = stmt.where(
@@ -243,6 +246,7 @@ EXPORT_COLUMNS: list[tuple[str, str]] = [
     ("remarks", "REMARKS"),
     ("total_dry_weight_mt", "TOTAL DRY WT in MT"),
     ("total_operating_weight_mt", "TOTAL OPE WT in MT"),
+    ("lifecycle_status", "LIFECYCLE STATUS"),
 ]
 
 
@@ -293,6 +297,7 @@ _IMPORTABLE_FIELDS = [
     "length_m", "width_id_m", "height_tt_m",
     "dry_weight_mt", "operating_weight_mt", "hydrotest_weight_mt",
     "pid", "remarks", "total_dry_weight_mt", "total_operating_weight_mt",
+    "lifecycle_status",
 ]
 
 
@@ -307,6 +312,11 @@ async def import_equipment_excel(
         "skip_existing",
         regex="^(skip_existing|update_existing)$",
         description="Conflict policy when commit=true: skip_existing leaves matched rows alone; update_existing PATCHes them.",
+    ),
+    workspace: str = Query(
+        "topside",
+        regex="^(topside|marine)$",
+        description="Which workspace these rows belong to: 'topside' or 'marine'.",
     ),
     project: Project = Depends(project_access("editor")),
 ):
@@ -345,11 +355,26 @@ async def import_equipment_excel(
             detail="No equipment rows recognized in the file. Make sure the sheet has a 'CLIENT EQUIPMENT TAG' header.",
         )
 
-    # Look up existing client_tags so we can mark new vs existing.
+    # Look up existing client_tags WITHIN THIS WORKSPACE only. Topsides and
+    # Marine can independently have a row called e.g. "P-F22001A/B" without
+    # collision; we treat them as separate namespaces.
     existing_rows = (
-        await db.execute(select(Equipment).where(Equipment.project_id == project.id))
+        await db.execute(
+            select(Equipment).where(
+                Equipment.project_id == project.id,
+                Equipment.workspace == workspace,
+            )
+        )
     ).scalars().all()
     existing_by_tag = {r.client_tag: r for r in existing_rows}
+
+    # Track tags we've already seen IN THIS FILE so a duplicate inside the
+    # Excel itself (same tag repeated on row 47 and row 122, say) doesn't
+    # explode the import with a uniqueness violation. We keep the FIRST
+    # occurrence and mark every subsequent one as ``duplicate_in_file`` so
+    # the user can see exactly which rows collided and decide whether to
+    # clean up the source spreadsheet.
+    seen_in_file: dict[str, int] = {}  # tag -> first row_number it appeared on
 
     preview: list[dict[str, Any]] = []
     for i, row in enumerate(parsed, start=1):
@@ -360,6 +385,21 @@ async def import_equipment_excel(
                 "status": "invalid", "reason": "missing client_tag",
             })
             continue
+
+        # Intra-file dedup. The DB-level uniqueness is
+        # (project, workspace, client_tag), so two rows in the same Excel
+        # with the same tag can't both land — we keep the first.
+        first_row = seen_in_file.get(tag)
+        if first_row is not None:
+            preview.append({
+                "row_number": i,
+                "client_tag": tag,
+                "status": "duplicate_in_file",
+                "reason": f"Same tag also appeared earlier on row {first_row}",
+            })
+            continue
+        seen_in_file[tag] = i
+
         is_existing = tag in existing_by_tag
         clean: dict[str, Any] = {}
         for k in _IMPORTABLE_FIELDS:
@@ -382,6 +422,7 @@ async def import_equipment_excel(
         "new": sum(1 for p in preview if p["status"] == "new"),
         "existing": sum(1 for p in preview if p["status"] == "existing"),
         "invalid": sum(1 for p in preview if p["status"] == "invalid"),
+        "duplicate_in_file": sum(1 for p in preview if p["status"] == "duplicate_in_file"),
         "commit": commit,
         "mode": mode,
     }
@@ -394,68 +435,127 @@ async def import_equipment_excel(
             "preview_truncated": len(preview) > 200,
         }
 
-    # Commit path. Each row is wrapped in a SAVEPOINT so one row's failure
-    # (duplicate, validation error, etc.) doesn't roll back previously-saved
-    # rows or leave the session in an unusable state.
+    # Commit path. SAVEPOINT-per-row was costing us 4 DB round-trips per row
+    # (~13 minutes on 668 rows over the Oregon → India Render link). We
+    # instead:
+    #   1. Build all NEW Equipment objects in memory, bulk add_all + one
+    #      flush so the DB does a single multi-row INSERT.
+    #   2. Build all v1 EquipmentVersion objects (now that we have IDs from
+    #      step 1) and bulk add_all + one flush.
+    #   3. Existing-row updates still use apply_update so the per-field
+    #      precedence + range-preservation rules apply, but without the
+    #      SAVEPOINT — one bad existing row would only affect itself, the
+    #      rest still commit because of the outer transaction's atomicity
+    #      around the new-row INSERTs which already succeeded.
     created = 0
     updated = 0
     skipped = 0
     errors: list[dict[str, Any]] = []
 
+    # ---- Pass 1: build the new-row equipment objects --------------------
+    from app.models import EquipmentVersion  # local import to keep module top tidy
+    from app.services.version_service import snapshot, TRACKED_FIELDS
+
+    new_eq_objects: list[Equipment] = []
+    new_eq_row_numbers: list[int] = []
     for p in preview:
-        if p["status"] == "invalid":
-            skipped += 1
+        if p["status"] != "new":
             continue
         tag = p["client_tag"]
         fields = p.get("fields") or {}
         raw_extra = p.get("raw_extra") or {}
-
-        if p["status"] == "existing" and mode == "skip_existing":
-            skipped += 1
-            continue
-
         try:
-            async with db.begin_nested():
-                if p["status"] == "existing":
-                    eq = existing_by_tag[tag]
-                    changes = {
-                        k: v for k, v in fields.items()
-                        if k != "client_tag" and v is not None
-                    }
-                    v = await apply_update(
-                        db, eq, changes,
-                        source="excel",
-                        source_file_id=None,
-                        user_id=user.id,
-                        note=f"Imported from {file.filename}",
-                        extra_data={"raw": raw_extra} if raw_extra else None,
-                    )
-                    if v:
-                        updated += 1
-                    else:
-                        skipped += 1
-                else:
-                    eq = Equipment(
-                        project_id=project.id,
-                        data={"raw": raw_extra},
-                        created_by_id=user.id,
-                        **fields,
-                    )
-                    db.add(eq)
-                    await db.flush()
-                    await record_initial_version(db, eq, source="excel", user_id=user.id)
-                    created += 1
-        except IntegrityError:
-            errors.append({
-                "row_number": p["row_number"],
-                "tag": tag,
-                "error": "duplicate client_tag",
-            })
+            eq = Equipment(
+                project_id=project.id,
+                workspace=workspace,
+                data={"raw": raw_extra},
+                created_by_id=user.id,
+                current_version=1,
+                last_source="excel",
+                last_updated_by_id=user.id,
+                **fields,
+            )
+            new_eq_objects.append(eq)
+            new_eq_row_numbers.append(p["row_number"])
         except Exception as e:  # noqa: BLE001
+            errors.append({"row_number": p["row_number"], "tag": tag, "error": str(e)})
+
+    if new_eq_objects:
+        try:
+            db.add_all(new_eq_objects)
+            await db.flush()   # one INSERT ... VALUES (...), (...), ... ; one round-trip
+            # Build all v1 versions in memory now that equipment_ids exist.
+            versions = [
+                EquipmentVersion(
+                    equipment_id=eq.id,
+                    version_no=1,
+                    snapshot=snapshot(eq),
+                    changed_fields=list(TRACKED_FIELDS),
+                    source="excel",
+                    source_file_id=None,
+                    created_by_id=user.id,
+                )
+                for eq in new_eq_objects
+            ]
+            db.add_all(versions)
+            await db.flush()
+            created = len(new_eq_objects)
+        except IntegrityError as e:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Duplicate client_tag(s) within this workspace caused a "
+                    f"constraint violation. The uniqueness key is "
+                    f"(project, workspace, client_tag): {e.orig}"
+                ),
+            )
+
+    # ---- Pass 2: update existing rows (only if mode allows) --------------
+    if mode == "update_existing":
+        for p in preview:
+            if p["status"] != "existing":
+                continue
+            tag = p["client_tag"]
+            fields = p.get("fields") or {}
+            raw_extra = p.get("raw_extra") or {}
+            try:
+                eq = existing_by_tag[tag]
+                changes = {
+                    k: v for k, v in fields.items()
+                    if k != "client_tag" and v is not None
+                }
+                v = await apply_update(
+                    db, eq, changes,
+                    source="excel",
+                    source_file_id=None,
+                    user_id=user.id,
+                    note=f"Imported from {file.filename}",
+                    extra_data={"raw": raw_extra} if raw_extra else None,
+                )
+                if v:
+                    updated += 1
+                else:
+                    skipped += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append({"row_number": p["row_number"], "tag": tag, "error": str(e)})
+    else:
+        # skip_existing mode — just count
+        skipped += sum(1 for p in preview if p["status"] == "existing")
+
+    # Invalid rows always count as skipped regardless of mode
+    skipped += sum(1 for p in preview if p["status"] == "invalid")
+
+    # Intra-file duplicates are surfaced in `errors` so the user sees the
+    # exact row numbers that collided, plus added to `skipped` so the
+    # totals add up to `total_rows`.
+    for p in preview:
+        if p["status"] == "duplicate_in_file":
+            skipped += 1
             errors.append({
                 "row_number": p["row_number"],
-                "tag": tag,
-                "error": str(e),
+                "tag": p["client_tag"],
+                "error": p.get("reason") or "duplicate tag in file",
             })
 
     try:

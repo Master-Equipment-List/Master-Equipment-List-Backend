@@ -151,14 +151,16 @@ async def browse(
     user: CurrentUser,
     project: Project = Depends(project_access("viewer")),
     item_id: str | None = Query(None, description="Folder item id to drill into; omit for project root."),
+    workspace: str = Query("topside", description="Which workspace's OneDrive root to browse: 'topside' or 'marine'."),
 ):
     try:
-        items = await onedrive_service.list_children(db, project, item_id=item_id)
+        items = await onedrive_service.list_children(db, project, item_id=item_id, workspace=workspace)
     except onedrive_service.OneDriveError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    root_path, _, _ = project.onedrive_root_for(workspace)
     return BrowseResponse(
         project_id=project.id,
-        root_path=project.onedrive_root_path,
+        root_path=root_path,
         items=[DriveItem(**i) for i in items],
     )
 
@@ -169,11 +171,15 @@ async def set_selection(
     db: DbSession,
     user: CurrentUser,
     project: Project = Depends(project_access("editor")),
+    workspace: str = Query("topside", description="Which workspace these selections belong to."),
 ):
     if payload.replace:
+        # Only delete THIS workspace's selections — the other workspace's
+        # picks stay intact.
         await db.execute(
             delete(ProjectOneDriveSelection).where(
-                ProjectOneDriveSelection.project_id == project.id
+                ProjectOneDriveSelection.project_id == project.id,
+                ProjectOneDriveSelection.workspace == workspace,
             )
         )
 
@@ -181,6 +187,7 @@ async def set_selection(
     for it in payload.items:
         row = ProjectOneDriveSelection(
             project_id=project.id,
+            workspace=workspace,
             item_id=it.item_id,
             item_path=it.item_path,
             item_type=it.item_type,
@@ -194,7 +201,11 @@ async def set_selection(
         action="onedrive.selection_set",
         user_id=user.id,
         project_id=project.id,
-        metadata={"count": len(payload.items), "replace": payload.replace},
+        metadata={
+            "count": len(payload.items),
+            "replace": payload.replace,
+            "workspace": workspace,
+        },
     )
     await db.commit()
     for c in created:
@@ -206,12 +217,12 @@ async def set_selection(
 async def get_selection(
     db: DbSession,
     project: Project = Depends(project_access("viewer")),
+    workspace: str | None = Query(None, description="Filter to one workspace; omit to return all."),
 ):
-    rows = (
-        await db.execute(
-            select(ProjectOneDriveSelection).where(
-                ProjectOneDriveSelection.project_id == project.id
-            )
-        )
-    ).scalars().all()
+    stmt = select(ProjectOneDriveSelection).where(
+        ProjectOneDriveSelection.project_id == project.id
+    )
+    if workspace:
+        stmt = stmt.where(ProjectOneDriveSelection.workspace == workspace)
+    rows = (await db.execute(stmt)).scalars().all()
     return rows

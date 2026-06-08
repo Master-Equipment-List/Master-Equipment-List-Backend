@@ -25,6 +25,10 @@ class ProjectFile(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    # "topside" | "marine" — see Equipment.workspace.
+    workspace: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="topside", index=True
+    )
 
     name: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     onedrive_item_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)

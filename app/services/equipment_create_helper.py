@@ -69,18 +69,22 @@ async def create_equipment_from_sync(
     source: str,
     source_file_id: int | None,
     user_id: int | None,
+    workspace: str = "topside",
 ) -> Equipment:
     """Create an Equipment row + record its initial version snapshot.
 
     Only fields in ``TRACKED_FIELDS`` are written from the ``fields`` dict —
     everything else is silently dropped. The new row's ``client_tag`` is
     set explicitly (it's a required column), and ``equipment_type`` is
-    inferred from the tag prefix if the caller didn't supply one.
+    inferred from the tag prefix if the caller didn't supply one. The
+    ``workspace`` ("topside" | "marine") partitions this row from the
+    other workspace's equipment list.
 
     Caller is responsible for ``db.commit()``.
     """
     eq = Equipment(
         project_id=project_id,
+        workspace=workspace,
         client_tag=client_tag,
     )
 

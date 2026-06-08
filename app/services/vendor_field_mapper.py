@@ -38,6 +38,7 @@ import re
 from typing import Any
 
 from app.config import settings
+from app.services._shared_client import get_anthropic_client
 
 log = logging.getLogger(__name__)
 
@@ -192,11 +193,6 @@ def map_vendor_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | No
     """
     if not is_enabled():
         return None
-    try:
-        from anthropic import Anthropic
-    except ImportError:
-        log.warning("anthropic SDK not installed; vendor field mapping disabled")
-        return None
 
     payload = json.dumps({"pages": vision_pages}, ensure_ascii=False)
     # Cap payload size — the vision JSON for a vendor sheet is rarely huge,
@@ -205,7 +201,11 @@ def map_vendor_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | No
     if len(payload) > 200_000:
         payload = payload[:200_000] + "\n...[truncated]"
 
-    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    try:
+        client = get_anthropic_client()
+    except RuntimeError:
+        log.warning("anthropic SDK not installed; vendor field mapping disabled")
+        return None
     try:
         resp = client.messages.create(
             model=settings.VISION_MODEL,

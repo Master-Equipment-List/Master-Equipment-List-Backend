@@ -36,6 +36,11 @@ class ProjectOneDriveSelection(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    # "topside" | "marine" — picks which workspace's sync this selection
+    # belongs to. Default "topside" for backward compat.
+    workspace: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="topside", index=True
+    )
     item_id: Mapped[str] = mapped_column(String(255), nullable=False)
     item_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     item_type: Mapped[str] = mapped_column(String(16), nullable=False)  # file | folder

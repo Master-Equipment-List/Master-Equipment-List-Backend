@@ -13,12 +13,24 @@ class Equipment(Base, TimestampMixin):
 
     __tablename__ = "equipment"
     __table_args__ = (
-        UniqueConstraint("project_id", "client_tag", name="uq_equipment_project_tag"),
+        # Same client_tag can legitimately exist in BOTH workspaces of a
+        # project (Topsides "P-F16030" and Marine "P-F16030" are unrelated
+        # equipment in different MELs). The unique key therefore spans
+        # (project_id, workspace, client_tag), not just (project_id, client_tag).
+        UniqueConstraint(
+            "project_id", "workspace", "client_tag",
+            name="uq_equipment_project_workspace_tag",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # "topside" | "marine" — partitions a project's equipment list so the
+    # two workspaces have independent MELs that share the same project shell.
+    workspace: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="topside", index=True
     )
 
     # Identification
@@ -60,6 +72,17 @@ class Equipment(Base, TimestampMixin):
     remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_dry_weight_mt: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_operating_weight_mt: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Marine MEL lifecycle flag — the source workbook has three adjacent
+    # dropdown columns ("SCRAPPED", "REFURBISHED", "NEW") and each
+    # equipment row ticks ZERO OR ONE of them (occasionally more on
+    # brownfield projects where a refurbished unit is also flagged "new
+    # spec"). We collapse the three columns into ONE string so the
+    # detail / list views can show a single badge. The value is the name
+    # of whichever box(es) are marked, joined with " / " when more than
+    # one. NULL means none were marked (or the workbook didn't have
+    # those columns at all — true for older Topsides sheets).
+    lifecycle_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Full record + any extras
     data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

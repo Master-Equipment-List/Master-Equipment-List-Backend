@@ -3,9 +3,49 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Equipment, EquipmentVersion
+
+
+# Source precedence — higher index wins. Once an equipment row has been
+# touched by a higher-priority source, lower-priority sources can't
+# overwrite it (their apply_update calls return None instead of changing
+# fields). Manual edits and Excel imports are ALWAYS allowed — they're
+# the engineer's explicit override channel.
+_SOURCE_PRIORITY = {
+    "seed":   0,
+    "pfd":    1,
+    "vendor": 2,
+    "pid":    3,
+    "repair": 99,  # internal — back-fill / fix-up; bypasses precedence
+    "manual": 99,
+    "excel":  99,
+}
+
+
+async def _has_higher_priority_source(
+    db: AsyncSession, equipment_id: int, current_source: str,
+) -> str | None:
+    """Returns the name of a higher-priority source that has previously
+    touched this equipment, or None when ``current_source`` is allowed to
+    update freely. Used to enforce P&ID-takes-precedence-over-PFD/Vendor.
+    """
+    current_p = _SOURCE_PRIORITY.get(current_source, 0)
+    # Sources that outrank what's being applied now.
+    higher = [s for s, p in _SOURCE_PRIORITY.items() if p > current_p and p < 99]
+    if not higher:
+        return None
+    row = (await db.execute(
+        select(EquipmentVersion.source)
+        .where(
+            EquipmentVersion.equipment_id == equipment_id,
+            EquipmentVersion.source.in_(higher),
+        )
+        .limit(1)
+    )).scalar_one_or_none()
+    return row
 
 # Fields that participate in equality / versioning. `data` is included separately.
 TRACKED_FIELDS = [
@@ -17,6 +57,7 @@ TRACKED_FIELDS = [
     "length_m", "width_id_m", "height_tt_m",
     "dry_weight_mt", "operating_weight_mt", "hydrotest_weight_mt",
     "pid", "remarks", "total_dry_weight_mt", "total_operating_weight_mt",
+    "lifecycle_status",
 ]
 
 
@@ -81,7 +122,21 @@ async def apply_update(
     diff of their two snapshots.
 
     The caller is responsible for ``db.commit()``.
+
+    Source-precedence rule: if this equipment row has been touched by a
+    higher-priority source (per ``_SOURCE_PRIORITY``), we silently skip
+    the update. Concretely: once a row has a P&ID version, PFD and
+    Vendor syncs are no-ops on that row. ``manual`` and ``excel`` always
+    win and can override P&ID-locked rows when the engineer needs to.
     """
+    blocked_by = await _has_higher_priority_source(db, eq.id, source)
+    if blocked_by:
+        # Caller (sync_service) can detect via the None return that this
+        # was a precedence skip rather than a real no-op. We don't raise
+        # here because a single sync can hit dozens of these and stack
+        # traces would be noise.
+        return None
+
     changed: list[str] = []
     preserved: list[str] = []
 

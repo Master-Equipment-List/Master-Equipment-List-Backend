@@ -12,15 +12,21 @@ async def trigger_sync(
     db: DbSession,
     user: CurrentUser,
     project: Project = Depends(project_access("editor")),
+    workspace: str = Query(
+        "topside",
+        description="Which workspace to sync: 'topside' or 'marine'. Each workspace has its own OneDrive root + selections.",
+    ),
     force: bool = Query(
         False,
         description="Re-download and re-parse even if the OneDrive lastModifiedDateTime hasn't changed.",
     ),
 ):
-    """Run sync inline. By default, files whose OneDrive modified timestamp
-    matches the last sync are skipped. Pass `force=true` to re-process all
-    selected items."""
-    summary = await sync_service.run_sync(db, project, user_id=user.id, force=force)
+    """Run sync inline for a workspace. By default, files whose OneDrive
+    modified timestamp matches the last sync are skipped.
+    """
+    summary = await sync_service.run_sync(
+        db, project, user_id=user.id, force=force, workspace=workspace
+    )
     return summary
 
 
@@ -30,6 +36,10 @@ async def trigger_single_item_sync(
     user: CurrentUser,
     project: Project = Depends(project_access("editor")),
     item_id: str = Query(..., description="OneDrive drive-item id to sync."),
+    workspace: str = Query(
+        "topside",
+        description="Which workspace this single-item sync belongs to: 'topside' or 'marine'.",
+    ),
     force: bool = Query(
         False,
         description="Re-download and re-parse even if the file's OneDrive modified timestamp hasn't changed.",
@@ -40,7 +50,7 @@ async def trigger_single_item_sync(
     """
     try:
         summary = await sync_service.sync_single_item(
-            db, project, item_id, user_id=user.id, force=force,
+            db, project, item_id, user_id=user.id, force=force, workspace=workspace,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))

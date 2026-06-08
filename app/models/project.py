@@ -22,10 +22,21 @@ class Project(Base, TimestampMixin):
     facility: Mapped[str | None] = mapped_column(String(255), nullable=True)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # OneDrive folder restriction (only this subtree is browsable / syncable).
+    # Legacy single-root OneDrive columns — kept for backward compatibility.
+    # New flow uses the per-workspace columns below (topside_*, marine_*).
     onedrive_drive_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     onedrive_root_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     onedrive_root_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    # Per-workspace OneDrive roots. Topside and Marine each have their own
+    # so a single project can host two independent sync targets.
+    topside_onedrive_drive_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    topside_onedrive_root_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    topside_onedrive_root_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    marine_onedrive_drive_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    marine_onedrive_root_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    marine_onedrive_root_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     created_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -34,6 +45,28 @@ class Project(Base, TimestampMixin):
     members: Mapped[list["ProjectMember"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+
+    def onedrive_root_for(self, workspace: str) -> tuple[str | None, str | None, str | None]:
+        """Resolve (root_path, root_item_id, drive_id) for a workspace.
+
+        Falls back to the legacy single-root columns when the workspace-
+        specific ones haven't been set yet — this keeps existing projects
+        working while users gradually configure separate Topside and Marine
+        roots.
+        """
+        if workspace == "marine":
+            return (
+                self.marine_onedrive_root_path or None,
+                self.marine_onedrive_root_item_id or None,
+                self.marine_onedrive_drive_id or None,
+            )
+        # Default to topside for any other value (incl. unknown — safer
+        # than raising mid-request).
+        return (
+            self.topside_onedrive_root_path or self.onedrive_root_path or None,
+            self.topside_onedrive_root_item_id or self.onedrive_root_item_id or None,
+            self.topside_onedrive_drive_id or self.onedrive_drive_id or None,
+        )
 
 
 class ProjectMember(Base, TimestampMixin):

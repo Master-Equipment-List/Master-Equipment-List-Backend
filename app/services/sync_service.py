@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,18 +33,77 @@ from app.services.version_service import apply_update
 
 
 PFD_CATEGORY = "PFD Samples"
+PID_CATEGORY = "P&ID"
 VENDOR_CATEGORY = "Vendor Data"
 
 
+def _workspace_onedrive_root_path(project: Project, workspace: str) -> str | None:
+    """Resolve which OneDrive root path applies for the given workspace.
+
+    Falls back to the legacy project.onedrive_root_path if the workspace-
+    specific column isn't populated yet (eases the transition for
+    existing projects).
+    """
+    if workspace == "marine":
+        return project.marine_onedrive_root_path or None
+    # Default: topside (or any unknown value)
+    return project.topside_onedrive_root_path or project.onedrive_root_path or None
+
+
 def _category_for_path(project_root: str | None, path: str) -> str | None:
-    """Infer folder category from path relative to project root."""
+    """Infer folder category from path relative to project root.
+
+    Matches path SEGMENTS (case-insensitive) rather than substring-matching
+    the whole path — that way a filename like ``20171-...-PFD-...pdf``
+    doesn't accidentally count as a "PFD" folder, and we accept short
+    aliases like ``PFD`` (no "Samples"), ``Vendor`` (no "Data"), ``PID``
+    (no ampersand) without false positives.
+    """
     if not path:
         return None
-    p = path.replace("\\", "/")
-    if PFD_CATEGORY.lower() in p.lower():
-        return PFD_CATEGORY
-    if VENDOR_CATEGORY.lower() in p.lower():
-        return VENDOR_CATEGORY
+
+    # Aliases that should resolve to each canonical category. Edit here if
+    # an EPC uses a folder name you'd like to support.
+    PFD_ALIASES = {
+        "pfd", "pfds",
+        "pfd samples", "pfd sample",
+        "pfd drawings", "pfd drawing",
+        "process flow", "process flow diagram", "process flow diagrams",
+    }
+    PID_ALIASES = {
+        # Ampersand spellings
+        "p&id", "p&ids",
+        "p&id samples", "p&id sample",       # ← the user's folder name
+        "p&id drawings", "p&id drawing",
+        "p&id documents",
+        # No-ampersand spellings
+        "pid", "pids",
+        "pid samples", "pid sample",
+        "pid drawings",
+        "pnid", "pnids",
+        # Spelled-out
+        "p and id", "p and ids",
+        "p and id samples", "p and id drawings",
+        "piping and instrumentation", "piping and instrumentation diagram",
+        "piping and instrumentation diagrams",
+    }
+    VENDOR_ALIASES = {
+        "vendor data", "vendor data sheets", "vendor data sheet",
+        "vendor", "vendors",
+        "vendor drawings", "vendor drawing",
+        "vendor docs", "vendor documents",
+        "vendor ga", "vendor gas",
+        "datasheet", "datasheets", "data sheets", "data sheet",
+    }
+
+    segments = [s.strip().lower() for s in path.replace("\\", "/").split("/") if s.strip()]
+    for seg in segments:
+        if seg in PFD_ALIASES:
+            return PFD_CATEGORY
+        if seg in PID_ALIASES:
+            return PID_CATEGORY
+        if seg in VENDOR_ALIASES:
+            return VENDOR_CATEGORY
     return None
 
 
@@ -58,12 +118,13 @@ async def _ensure_local_file(
 
 
 async def _expand_selections(
-    db: AsyncSession, project: Project
+    db: AsyncSession, project: Project, workspace: str = "topside"
 ) -> list[dict[str, Any]]:
     selections = (
         await db.execute(
             select(ProjectOneDriveSelection).where(
-                ProjectOneDriveSelection.project_id == project.id
+                ProjectOneDriveSelection.project_id == project.id,
+                ProjectOneDriveSelection.workspace == workspace,
             )
         )
     ).scalars().all()
@@ -87,7 +148,11 @@ async def _expand_selections(
 
 
 async def _upsert_project_file(
-    db: AsyncSession, project: Project, drive_item: dict[str, Any], local_path: str
+    db: AsyncSession,
+    project: Project,
+    drive_item: dict[str, Any],
+    local_path: str,
+    workspace: str = "topside",
 ) -> ProjectFile:
     existing = (
         await db.execute(
@@ -99,7 +164,8 @@ async def _upsert_project_file(
     ).scalar_one_or_none()
 
     extension = Path(drive_item["name"]).suffix.lower() or None
-    category = _category_for_path(project.onedrive_root_path, drive_item.get("path", ""))
+    root_path = _workspace_onedrive_root_path(project, workspace)
+    category = _category_for_path(root_path, drive_item.get("path", ""))
     modified_at = None
     if drive_item.get("modified_at"):
         try:
@@ -109,6 +175,7 @@ async def _upsert_project_file(
 
     if existing:
         existing.name = drive_item["name"]
+        existing.workspace = workspace
         existing.onedrive_path = drive_item.get("path") or existing.onedrive_path
         existing.folder_category = category
         existing.mime_type = drive_item.get("mime_type")
@@ -123,6 +190,7 @@ async def _upsert_project_file(
 
     pf = ProjectFile(
         project_id=project.id,
+        workspace=workspace,
         name=drive_item["name"],
         onedrive_item_id=drive_item["id"],
         onedrive_path=drive_item.get("path") or "",
@@ -141,10 +209,11 @@ async def _upsert_project_file(
 
 
 async def _parse_and_store(db: AsyncSession, pf: ProjectFile) -> FileExtraction:
-    # Vision handles every PDF type (text-based, scanned, drawings)
-    # uniformly. force_ocr only matters if vision is unavailable — in
-    # that case let the parser decide via its own scanned-page detection.
-    result = parse_file(pf.local_path)
+    # Run parse_file in a thread — it calls vision_pfd_service.extract()
+    # which blocks internally (ThreadPoolExecutor + Claude API calls).
+    # Offloading to a thread keeps the asyncio event loop free so other
+    # requests continue to be served while vision is running.
+    result = await asyncio.to_thread(parse_file, pf.local_path)
     ext = FileExtraction(
         file_id=pf.id,
         parser=result.parser,
@@ -189,7 +258,9 @@ async def _apply_pfd_updates(
     if not pages:
         return 0
 
-    mapping = pfd_field_mapper.map_pfd_fields(pages)
+    # map_pfd_fields makes a synchronous Anthropic API call — run in a thread
+    # so the event loop stays responsive during the ~10-20 s round-trip.
+    mapping = await asyncio.to_thread(pfd_field_mapper.map_pfd_fields, pages)
     if not mapping:
         return 0
 
@@ -201,14 +272,26 @@ async def _apply_pfd_updates(
     if not equipment_entries:
         return 0
 
+    from app.services.version_service import _has_higher_priority_source
+
+    # Preload all equipment once — avoids a full-table scan per tag.
+    eq_map = await _load_equipment_map(db, project.id, workspace=file.workspace)
+
     affected = 0
     for entry in equipment_entries:
         tag = entry.get("client_equipment_tag")
         fields = {k: v for k, v in (entry.get("fields") or {}).items() if v}
         if not tag or not fields:
             continue
-        eq = await _find_equipment_by_tag(db, project.id, tag)
+        eq = _find_equipment_in_map(eq_map, tag)
         if eq:
+            # If this row is locked by a higher-priority source (P&ID),
+            # count the skip explicitly so the user sees it in the summary.
+            blocked_by = await _has_higher_priority_source(db, eq.id, "pfd")
+            if blocked_by:
+                if summary is not None:
+                    summary["pid_locked_skips"] = (summary.get("pid_locked_skips") or 0) + 1
+                continue
             v = await apply_update(
                 db, eq, fields,
                 source="pfd",
@@ -224,6 +307,83 @@ async def _apply_pfd_updates(
                 source="pfd",
                 source_file_id=file.id,
                 user_id=user_id,
+                workspace=file.workspace,
+            )
+            affected += 1
+            if summary is not None:
+                summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+    return affected
+
+
+async def _apply_pid_updates(
+    db: AsyncSession,
+    project: Project,
+    file: ProjectFile,
+    extraction: FileExtraction,
+    user_id: int | None,
+    summary: dict[str, Any] | None = None,
+) -> int:
+    """Apply P&ID updates to every matching equipment row, AND auto-create
+    rows for any tags the P&ID names that don't exist yet in the project.
+
+    Mirrors ``_apply_pfd_updates``'s shape but stamps source="pid". P&ID
+    is the HIGHEST-priority source in the precedence ladder
+    (seed < pfd < vendor < pid), so once a row has been touched by a
+    P&ID, subsequent PFD/Vendor syncs will be blocked from overwriting
+    by ``_has_higher_priority_source`` — which means P&ID itself never
+    needs to consult that check.
+
+    Returns the number of equipment rows touched (updated + created).
+    When a ``summary`` dict is passed, it's mutated to record creation
+    counts under ``equipment_created``.
+    """
+    from app.services import pid_field_mapper
+    from app.services.equipment_create_helper import create_equipment_from_sync
+
+    pages = (extraction.data or {}).get("vision_pages") or []
+    if not pages:
+        return 0
+
+    # map_pid_fields makes a synchronous Anthropic API call — run in a thread.
+    mapping = await asyncio.to_thread(pid_field_mapper.map_pid_fields, pages)
+    if not mapping:
+        return 0
+
+    new_data = dict(extraction.data or {})
+    new_data["pid"] = mapping
+    extraction.data = new_data
+
+    equipment_entries = mapping.get("equipment") or []
+    if not equipment_entries:
+        return 0
+
+    # Preload all equipment once — avoids a full-table scan per tag.
+    eq_map = await _load_equipment_map(db, project.id, workspace=file.workspace)
+
+    affected = 0
+    for entry in equipment_entries:
+        tag = entry.get("client_equipment_tag")
+        fields = {k: v for k, v in (entry.get("fields") or {}).items() if v}
+        if not tag or not fields:
+            continue
+        eq = _find_equipment_in_map(eq_map, tag)
+        if eq:
+            v = await apply_update(
+                db, eq, fields,
+                source="pid",
+                source_file_id=file.id,
+                user_id=user_id,
+                note=f"P&ID update from {file.name}",
+            )
+            if v:
+                affected += 1
+        else:
+            await create_equipment_from_sync(
+                db, project.id, tag.strip(), fields,
+                source="pid",
+                source_file_id=file.id,
+                user_id=user_id,
+                workspace=file.workspace,
             )
             affected += 1
             if summary is not None:
@@ -254,7 +414,8 @@ async def _apply_vendor_updates(
     if not pages:
         return 0
 
-    mapping = vendor_field_mapper.map_vendor_fields(pages)
+    # map_vendor_fields makes a synchronous Anthropic API call — run in a thread.
+    mapping = await asyncio.to_thread(vendor_field_mapper.map_vendor_fields, pages)
     if not mapping:
         return 0
 
@@ -267,8 +428,16 @@ async def _apply_vendor_updates(
     if not tag or not fields:
         return 0
 
-    eq = await _find_equipment_by_tag(db, project.id, tag)
+    from app.services.version_service import _has_higher_priority_source
+
+    eq_map = await _load_equipment_map(db, project.id, workspace=file.workspace)
+    eq = _find_equipment_in_map(eq_map, tag)
     if eq:
+        blocked_by = await _has_higher_priority_source(db, eq.id, "vendor")
+        if blocked_by:
+            if summary is not None:
+                summary["pid_locked_skips"] = (summary.get("pid_locked_skips") or 0) + 1
+            return 0
         v = await apply_update(
             db, eq, fields,
             source="vendor",
@@ -283,25 +452,46 @@ async def _apply_vendor_updates(
             source="vendor",
             source_file_id=file.id,
             user_id=user_id,
+            workspace=file.workspace,
         )
         if summary is not None:
             summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
         return 1
 
 
-async def _find_equipment_by_tag(
-    db: AsyncSession, project_id: int, tag: str
-) -> Equipment | None:
-    norm = normalize_tag(tag)
-    rows = (
-        await db.execute(select(Equipment).where(Equipment.project_id == project_id))
-    ).scalars().all()
+async def _load_equipment_map(
+    db: AsyncSession, project_id: int, workspace: str | None = None
+) -> dict[str, Equipment]:
+    """Load all equipment for a project into a {normalized_tag: Equipment} dict.
+
+    Call once before a batch of tag lookups; pass the result to
+    ``_find_equipment_in_map`` instead of hitting the DB per tag.
+    """
+    stmt = select(Equipment).where(Equipment.project_id == project_id)
+    if workspace:
+        stmt = stmt.where(Equipment.workspace == workspace)
+    rows = (await db.execute(stmt)).scalars().all()
+    mapping: dict[str, Equipment] = {}
     for r in rows:
-        if normalize_tag(r.client_tag) == norm:
-            return r
-        if r.old_tag and normalize_tag(r.old_tag) == norm:
-            return r
-    return None
+        if r.client_tag:
+            mapping[normalize_tag(r.client_tag)] = r
+        if r.old_tag:
+            mapping.setdefault(normalize_tag(r.old_tag), r)
+    return mapping
+
+
+def _find_equipment_in_map(eq_map: dict[str, Equipment], tag: str) -> Equipment | None:
+    return eq_map.get(normalize_tag(tag))
+
+
+async def _find_equipment_by_tag(
+    db: AsyncSession, project_id: int, tag: str, workspace: str | None = None,
+) -> Equipment | None:
+    """Single-tag lookup. Prefer _load_equipment_map + _find_equipment_in_map
+    when doing many lookups in one pass (avoids N full-table scans).
+    """
+    eq_map = await _load_equipment_map(db, project_id, workspace)
+    return _find_equipment_in_map(eq_map, tag)
 
 
 def _parse_modified(drive_item: dict[str, Any]) -> datetime | None:
@@ -327,42 +517,41 @@ async def _existing_project_file(
     ).scalar_one_or_none()
 
 
-async def run_sync(
+async def _process_drive_items(
     db: AsyncSession,
     project: Project,
-    user_id: int | None = None,
-    *,
-    force: bool = False,
-) -> dict[str, Any]:
-    """Top-level sync runner.
+    drive_items: list[dict[str, Any]],
+    local_dir: Path,
+    workspace: str,
+    user_id: int | None,
+    force: bool,
+    summary: dict[str, Any],
+) -> None:
+    """Two-phase pipeline for syncing a list of drive items.
 
-    By default, files whose OneDrive `lastModifiedDateTime` matches what we
-    already have on the corresponding ProjectFile row are **skipped** — no
-    download, no re-parse, no re-extract. Pass `force=True` to bypass this
-    short-circuit and re-process every selected item (useful if the parser
-    or extractor logic itself has changed).
+    ── Phase 1 (parallel) ──────────────────────────────────────────────────
+    Up to 3 files are downloaded and vision-parsed concurrently. The
+    Anthropic SDK is synchronous so each file's parse runs in its own
+    thread (asyncio.to_thread inside _parse_and_store). While one file is
+    waiting for Claude to respond the event loop can advance other files'
+    downloads, token checks, etc.
+
+    ── Phase 2 (sequential) ────────────────────────────────────────────────
+    All DB writes and field-mapper LLM calls happen in order, one file at a
+    time. This keeps the SQLAlchemy AsyncSession safe (it is not designed
+    for concurrent coroutine use) and prevents conflicting writes to the
+    same equipment row when multiple files refer to the same tag.
     """
-    local_dir = settings.storage_path / f"project_{project.id}"
-    summary = {
-        "project_id": project.id,
-        "force": force,
-        "files_synced": 0,
-        "files_skipped": 0,
-        "files_failed": 0,
-        "pfd_updates_applied": 0,
-        "vendor_updates_applied": 0,
-        "equipment_created": 0,
-        "errors": [],
-    }
 
-    drive_items = await _expand_selections(db, project)
+    # ── Phase 1: parallel skip-check + download + vision ──────────────────
+    sem = asyncio.Semaphore(3)  # max 3 files in-flight simultaneously
 
-    for it in drive_items:
-        try:
+    async def _fetch_one(it: dict[str, Any]) -> dict[str, Any]:
+        """Download + vision-parse one item. No equipment DB writes."""
+        async with sem:
             existing = await _existing_project_file(db, project, it)
             incoming_modified = _parse_modified(it)
 
-            # Skip if we already synced this version of the file.
             if (
                 not force
                 and existing
@@ -373,28 +562,119 @@ async def run_sync(
                 and existing.local_path
                 and Path(existing.local_path).exists()
             ):
-                summary["files_skipped"] += 1
-                # refresh the last_synced_at marker so we know we "checked"
+                # Touch last_synced_at so we know this was checked.
                 existing.last_synced_at = datetime.now(timezone.utc)
-                continue
+                return {"action": "skip", "it": it}
 
             local_path = await _ensure_local_file(db, project, it, local_dir)
-            pf = await _upsert_project_file(db, project, it, local_path)
-            extraction = await _parse_and_store(db, pf)
+            # parse_file calls vision_pfd_service.extract() which itself fans
+            # out to many Claude API calls via a ThreadPoolExecutor. Running
+            # the whole thing in a thread lets other files proceed in the event
+            # loop while this file's vision is in-flight.
+            parse_result = await asyncio.to_thread(parse_file, local_path)
+            return {
+                "action": "process",
+                "it": it,
+                "local_path": local_path,
+                "parse_result": parse_result,
+            }
+
+    fetch_results = await asyncio.gather(
+        *[_fetch_one(it) for it in drive_items],
+        return_exceptions=True,
+    )
+
+    # ── Phase 2: sequential DB writes ─────────────────────────────────────
+    for fetch in fetch_results:
+        if isinstance(fetch, Exception):
+            summary["files_failed"] += 1
+            summary["errors"].append({"item": "unknown", "error": str(fetch)})
+            continue
+
+        it: dict[str, Any] = fetch["it"]
+        try:
+            if fetch["action"] == "skip":
+                summary["files_skipped"] += 1
+                continue
+
+            local_path: str = fetch["local_path"]
+            parse_result = fetch["parse_result"]
+
+            pf = await _upsert_project_file(
+                db, project, it, local_path, workspace=workspace
+            )
+
+            # Persist the pre-computed ParseResult directly (no re-parsing).
+            ext = FileExtraction(
+                file_id=pf.id,
+                parser=parse_result.parser,
+                status=parse_result.status,
+                error=parse_result.error,
+                pages=parse_result.pages,
+                used_ocr=parse_result.used_ocr,
+                data=parse_result.data,
+            )
+            db.add(ext)
+            await db.flush()
 
             if pf.folder_category == PFD_CATEGORY:
                 summary["pfd_updates_applied"] += await _apply_pfd_updates(
-                    db, project, pf, extraction, user_id, summary
+                    db, project, pf, ext, user_id, summary
+                )
+            elif pf.folder_category == PID_CATEGORY:
+                summary["pid_updates_applied"] += await _apply_pid_updates(
+                    db, project, pf, ext, user_id, summary
                 )
             elif pf.folder_category == VENDOR_CATEGORY:
                 summary["vendor_updates_applied"] += await _apply_vendor_updates(
-                    db, project, pf, extraction, user_id, summary
+                    db, project, pf, ext, user_id, summary
                 )
 
             summary["files_synced"] += 1
+
         except Exception as e:  # noqa: BLE001
             summary["files_failed"] += 1
             summary["errors"].append({"item": it.get("name"), "error": str(e)})
+
+
+async def run_sync(
+    db: AsyncSession,
+    project: Project,
+    user_id: int | None = None,
+    *,
+    force: bool = False,
+    workspace: str = "topside",
+) -> dict[str, Any]:
+    """Top-level sync runner for one workspace.
+
+    Only selections / files attached to this workspace are processed.
+    The OneDrive root used for browsing is the workspace-specific one
+    on the project row.
+    """
+    local_dir = settings.storage_path / f"project_{project.id}_{workspace}"
+    summary = {
+        "project_id": project.id,
+        "workspace": workspace,
+        "force": force,
+        "files_synced": 0,
+        "files_skipped": 0,
+        "files_failed": 0,
+        "pfd_updates_applied": 0,
+        "pid_updates_applied": 0,
+        "vendor_updates_applied": 0,
+        "equipment_created": 0,
+        # Updates that were silently skipped because a higher-priority
+        # source (P&ID) had already set the row. Helps users understand
+        # why PFD/Vendor updates didn't take effect this sync.
+        "pid_locked_skips": 0,
+        "errors": [],
+    }
+
+    drive_items = await _expand_selections(db, project, workspace=workspace)
+
+    await _process_drive_items(
+        db, project, drive_items, local_dir, workspace, user_id, force, summary
+    )
 
     await audit_service.log(
         db,
@@ -414,6 +694,7 @@ async def sync_single_item(
     user_id: int | None = None,
     *,
     force: bool = False,
+    workspace: str = "topside",
 ) -> dict[str, Any]:
     """Sync ONE OneDrive item by its drive-item id, without touching the
     project's persistent selection.
@@ -422,17 +703,23 @@ async def sync_single_item(
     Useful for ad-hoc "sync this file" / "sync this folder" actions from the
     browse list.
     """
-    local_dir = settings.storage_path / f"project_{project.id}"
+    local_dir = settings.storage_path / f"project_{project.id}_{workspace}"
     summary: dict[str, Any] = {
         "project_id": project.id,
+        "workspace": workspace,
         "force": force,
         "item_id": item_id,
         "files_synced": 0,
         "files_skipped": 0,
         "files_failed": 0,
         "pfd_updates_applied": 0,
+        "pid_updates_applied": 0,
         "vendor_updates_applied": 0,
         "equipment_created": 0,
+        # Updates that were silently skipped because a higher-priority
+        # source (P&ID) had already set the row. Helps users understand
+        # why PFD/Vendor updates didn't take effect this sync.
+        "pid_locked_skips": 0,
         "errors": [],
     }
 
@@ -461,41 +748,9 @@ async def sync_single_item(
             "mime_type": (item.get("file") or {}).get("mimeType"),
         }]
 
-    for it in drive_items:
-        try:
-            existing = await _existing_project_file(db, project, it)
-            incoming_modified = _parse_modified(it)
-            if (
-                not force
-                and existing
-                and existing.sync_status == "synced"
-                and existing.onedrive_modified_at is not None
-                and incoming_modified is not None
-                and existing.onedrive_modified_at == incoming_modified
-                and existing.local_path
-                and Path(existing.local_path).exists()
-            ):
-                summary["files_skipped"] += 1
-                existing.last_synced_at = datetime.now(timezone.utc)
-                continue
-
-            local_path = await _ensure_local_file(db, project, it, local_dir)
-            pf = await _upsert_project_file(db, project, it, local_path)
-            extraction = await _parse_and_store(db, pf)
-
-            if pf.folder_category == PFD_CATEGORY:
-                summary["pfd_updates_applied"] += await _apply_pfd_updates(
-                    db, project, pf, extraction, user_id, summary
-                )
-            elif pf.folder_category == VENDOR_CATEGORY:
-                summary["vendor_updates_applied"] += await _apply_vendor_updates(
-                    db, project, pf, extraction, user_id, summary
-                )
-
-            summary["files_synced"] += 1
-        except Exception as e:  # noqa: BLE001
-            summary["files_failed"] += 1
-            summary["errors"].append({"item": it.get("name"), "error": str(e)})
+    await _process_drive_items(
+        db, project, drive_items, local_dir, workspace, user_id, force, summary
+    )
 
     await audit_service.log(
         db,

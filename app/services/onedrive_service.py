@@ -182,27 +182,35 @@ def _normalize_drive_item(it: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def list_children(db: AsyncSession, project: Project, item_id: str | None = None) -> list[dict[str, Any]]:
-    """List children of project root or a specific subfolder.
+async def list_children(
+    db: AsyncSession,
+    project: Project,
+    item_id: str | None = None,
+    workspace: str = "topside",
+) -> list[dict[str, Any]]:
+    """List children of a workspace's OneDrive root, or a specific subfolder.
 
-    `item_id` must be inside the project root if provided. We trust the
-    initial root (set on project create) and only navigate by item_id from
-    there, which Graph already scopes correctly because the parent must
-    have been listed first.
+    ``workspace`` selects which root to use (Topside vs Marine). When
+    ``item_id`` is given the root is irrelevant — Graph scopes by the
+    parent item directly — but the drive id still depends on the
+    workspace's drive_id setting.
     """
     token = await get_valid_token(db)
-    drive_seg = f"/drives/{project.onedrive_drive_id}" if project.onedrive_drive_id else "/me/drive"
+    root_path, root_item_id, drive_id = project.onedrive_root_for(workspace)
+    drive_seg = f"/drives/{drive_id}" if drive_id else "/me/drive"
 
     if item_id:
         url = f"{GRAPH_BASE}{drive_seg}/items/{item_id}/children"
-    elif project.onedrive_root_item_id:
-        url = f"{GRAPH_BASE}{drive_seg}/items/{project.onedrive_root_item_id}/children"
-    elif project.onedrive_root_path:
-        path = project.onedrive_root_path.strip("/")
+    elif root_item_id:
+        url = f"{GRAPH_BASE}{drive_seg}/items/{root_item_id}/children"
+    elif root_path:
+        path = root_path.strip("/")
         encoded = urllib.parse.quote(path)
         url = f"{GRAPH_BASE}{drive_seg}/root:/{encoded}:/children"
     else:
-        raise OneDriveError("Project has no OneDrive root configured")
+        raise OneDriveError(
+            f"Project has no OneDrive root configured for the {workspace} workspace."
+        )
 
     items: list[dict[str, Any]] = []
     while url:
@@ -250,19 +258,30 @@ async def browse_my_drive(
     return items
 
 
-async def get_item(db: AsyncSession, project: Project, item_id: str) -> dict[str, Any]:
+async def get_item(
+    db: AsyncSession,
+    project: Project,
+    item_id: str,
+    workspace: str = "topside",
+) -> dict[str, Any]:
     token = await get_valid_token(db)
-    drive_seg = f"/drives/{project.onedrive_drive_id}" if project.onedrive_drive_id else "/me/drive"
+    _, _, drive_id = project.onedrive_root_for(workspace)
+    drive_seg = f"/drives/{drive_id}" if drive_id else "/me/drive"
     data = await _graph_get(token, f"{GRAPH_BASE}{drive_seg}/items/{item_id}")
     return data
 
 
-async def walk_folder(db: AsyncSession, project: Project, folder_item_id: str) -> AsyncIterator[dict[str, Any]]:
+async def walk_folder(
+    db: AsyncSession,
+    project: Project,
+    folder_item_id: str,
+    workspace: str = "topside",
+) -> AsyncIterator[dict[str, Any]]:
     """Recursively yield all files under a folder item id."""
     queue: list[str] = [folder_item_id]
     while queue:
         current = queue.pop(0)
-        children = await list_children(db, project, item_id=current)
+        children = await list_children(db, project, item_id=current, workspace=workspace)
         for c in children:
             if c["type"] == "folder":
                 queue.append(c["id"])
@@ -270,10 +289,17 @@ async def walk_folder(db: AsyncSession, project: Project, folder_item_id: str) -
                 yield c
 
 
-async def download_item(db: AsyncSession, project: Project, item_id: str, dest_path: str) -> int:
+async def download_item(
+    db: AsyncSession,
+    project: Project,
+    item_id: str,
+    dest_path: str,
+    workspace: str = "topside",
+) -> int:
     """Download an item to dest_path; returns bytes written."""
     token = await get_valid_token(db)
-    drive_seg = f"/drives/{project.onedrive_drive_id}" if project.onedrive_drive_id else "/me/drive"
+    _, _, drive_id = project.onedrive_root_for(workspace)
+    drive_seg = f"/drives/{drive_id}" if drive_id else "/me/drive"
     url = f"{GRAPH_BASE}{drive_seg}/items/{item_id}/content"
     written = 0
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
