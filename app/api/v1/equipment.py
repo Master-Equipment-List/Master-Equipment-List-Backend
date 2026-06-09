@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -211,73 +214,355 @@ async def bulk_delete_equipment(
     return {"deleted": len(found_ids), "not_found": not_found}
 
 
-# --- Excel export matching the Topside template ---
-
-EXPORT_COLUMNS: list[tuple[str, str]] = [
-    ("rev_no", "REV No."),
-    ("old_tag", "OLD EQUIPMENT / TAG No."),
-    ("client_tag", "CLIENT EQUIPMENT TAG"),
-    ("description", "DESCRIPTION"),
-    ("vendor", "VENDOR"),
-    ("equipment_type", "EQUIPMENT TYPE"),
-    ("module", "MODULE"),
-    ("design_code", "EQUIPMENT DESIGN CODE/CLASS"),
-    ("orientation", "ORIENTATION"),
-    ("material", "MATERIAL OF CONSTRUCTION"),
-    ("configuration", "CONFIGURATION"),
-    ("location", "LOCATION"),
-    ("operating_press", "OPERATING PRESS (barg)"),
-    ("operating_temp", "OPERATING TEMP (oC)"),
-    ("design_press", "DESIGN PRESS (barg)"),
-    ("design_temp", "DESIGN TEMP (oC)"),
-    ("design_flow", "DESIGN FLOW m3/hr"),
-    ("pump_capacity", "PUMP / COMPRESSOR / TANK CAPACITY"),
-    ("heat_exchanger_duty_kw", "HEAT EXCHANGER DUTY (kW)"),
-    ("liquid_fill", "LIQUID FILL"),
-    ("absorbed_power_kw", "ABSORBED POWER PER UNIT (kW)"),
-    ("rated_power_kw", "RATED POWER PER UNIT (kW)"),
-    ("length_m", "L or T/T (m)"),
-    ("width_id_m", "W or I.D (m)"),
-    ("height_tt_m", "H or T/T (m)"),
-    ("dry_weight_mt", "DRY WT in MT"),
-    ("operating_weight_mt", "OPE WT in MT"),
-    ("hydrotest_weight_mt", "HYDROTEST WT in MT"),
-    ("pid", "P&ID"),
-    ("remarks", "REMARKS"),
-    ("total_dry_weight_mt", "TOTAL DRY WT in MT"),
-    ("total_operating_weight_mt", "TOTAL OPE WT in MT"),
-    ("lifecycle_status", "LIFECYCLE STATUS"),
+# ---------------------------------------------------------------------------
+# Excel export — matches the reference EPC template
+# (``20171-SPOG-80000-ME-LS-0001_Z1_Topside Eqipment List.xlsx``)
+# ---------------------------------------------------------------------------
+#
+# Each tuple: (attr_on_Equipment, header_text_with_explicit_newlines, width).
+# Header text uses real "\n" so cells with wrap_text=True render multi-line
+# (e.g. "EQUIPMENT\nTYPE", "OPERATING PRESS\n(barg)") — same as the reference.
+# Order, casing, spacing, and trailing-spaces are preserved verbatim from the
+# reference workbook so the downstream EPC workflow that consumes this file
+# doesn't see any surprises.
+EXPORT_COLUMNS: list[tuple[str, str, int]] = [
+    ("rev_no",                    "REV No.",                              8),
+    ("old_tag",                   "OLD 'EQUIPMENT /\nTAG No.",            15),
+    ("client_tag",                "CLIENT EQUIPMENT \nTAG",               18),
+    ("description",               "DESCRIPTION",                          36),
+    ("vendor",                    "VENDOR",                               22),
+    ("equipment_type",            "EQUIPMENT\nTYPE",                      18),
+    ("module",                    "MODULE",                               12),
+    ("design_code",               "EQUIPMENT\nDESIGN\nCODE/CLASS",        16),
+    ("orientation",               "ORIENTATION",                          12),
+    ("material",                  "MATERIAL OF CONSTRUCTION ",            26),
+    ("configuration",             "CONFIGURATION",                        14),
+    ("location",                  "LOCATION",                             18),
+    ("operating_press",           "OPERATING PRESS\n(barg)",              14),
+    ("operating_temp",            "OPERATING TEMP\n(oC)",                 14),
+    ("design_press",              "DESIGN PRESS\n(barg)",                 12),
+    ("design_temp",               "DESIGN TEMP\n(oC)",                    12),
+    ("design_flow",               "DESIGN FLOW m3/hr",                    14),
+    ("pump_capacity",             "PUMP / COMPRESSOR / TANK CAPACITY",    20),
+    ("heat_exchanger_duty_kw",    " HEAT EXCHANGER DUTY (kW)",            18),
+    ("liquid_fill",               "LIQUID FILL",                          12),
+    ("absorbed_power_kw",         "ABSORBED\nPOWER PER UNIT\n(kW)",       14),
+    ("rated_power_kw",            "RATED\nPOWER PER UNIT\n(kW)",          14),
+    ("length_m",                  "L or\nT/T\n(m)",                       9),
+    ("width_id_m",                "W or I.D\n(m)",                        9),
+    ("height_tt_m",               "H or T/T\n(m)",                        9),
+    ("dry_weight_mt",             "DRY WT       in MT",                   12),
+    ("operating_weight_mt",       "OPE WT in MT",                         12),
+    ("pid",                       "P&ID",                                 24),
+    ("remarks",                   "REMARKS",                              22),
+    ("total_dry_weight_mt",       "TOTAL DRY WT\nin mT",                  12),
+    ("total_operating_weight_mt", "TOTAL OPE WT\nin mT",                  12),
 ]
 
+# Header layout — mirrors the reference EPC workbook
+# (`20171-SPOG-80000-ME-LS-0001_Z1_Topside Eqipment List.xlsx`).
+#
+#   ┌──────────────┬─────────── TOPSIDES EQUIPMENT LIST ────────┬──────────┐
+#   │              │                                            │ COMPANY  │
+#   │  LOGO AREA   │                                            │ PROJECT  │
+#   │  (reserved)  │                                            │ PROJECT  │
+#   │              │                                            │ Doc No.  │
+#   └──────────────┴─────────────────────────────────────────────┴──────────┘
+#   │   REV │ OLD TAG │ CLIENT TAG │ … (column headers with filter arrows) │
+#   ├──────────────────────────────────────────────────────────────────────┤
+#   │ MODULE MD: FLARE KNOCK OUT DRUMS & PUMPS / …  (section banner)       │
+#   │ <equipment rows>                                                      │
+#   ├──────────────────────────────────────────────────────────────────────┤
+#   │ MODULE M10: …                                                         │
+#   │ <equipment rows>                                                      │
+#   └──────────────────────────────────────────────────────────────────────┘
+_LOGO_COL_START = 1   # column A — reserved logo area (left side)
+_LOGO_COL_END = 6     # column F
+_TITLE_COL_START = 7  # column G — "TOPSIDES EQUIPMENT LIST" centered
+_TITLE_COL_END = 24   # column X
+_TITLE_LABEL_COL = 26 # column Z   — "COMPANY", "PROJECT No.", …
+_TITLE_LABEL_END = 28 # column AB  — merged label cell
+_TITLE_VALUE_COL = 29 # column AC  — "ONGC", "20171", …
+_TITLE_VALUE_END = 31 # column AE  — merged value cell to right edge
+_TITLE_BLOCK_ROWS = 4 # rows 1-4
 
-@router.get("/projects/{project_id}/export/excel")
+_HEADER_FILL = PatternFill("solid", fgColor="FFF2CC")  # pale yellow — column headers
+_BANNER_FILL = PatternFill("solid", fgColor="C6EFCE")  # mint green   — module banners
+_TITLE_LABEL_FILL = PatternFill("solid", fgColor="F2F2F2")  # light grey — title-block labels
+_THIN  = Side(style="thin",  color="999999")
+_MED   = Side(style="medium", color="000000")
+_BORDER     = Border(top=_THIN, left=_THIN, right=_THIN, bottom=_THIN)
+_BOX_BORDER = Border(top=_MED,  left=_MED,  right=_MED,  bottom=_MED)
+
+
+def _value_for_export(v: Any) -> Any:
+    """Render an equipment value for Excel.
+
+    Numbers stored as strings stay as strings (the reference workbook
+    routinely uses ``"38.0"`` / ``"FV / 7"`` / ``"-29 / 120 "`` in numeric-
+    looking columns). None becomes the literal ``"-"`` the reference uses
+    for empty cells, so a downstream parser doesn't see blank cells where
+    the contractor expects a dash.
+    """
+    if v is None or v == "":
+        return "-"
+    return v
+
+
+def _find_header_logo() -> Path | None:
+    """Look for a header image to embed in the Excel export's logo area.
+
+    Checks ``app/static/logos/`` for the first file matching one of the
+    accepted names. We try the project's branded filename first
+    (``SP-Oil-Gas.png``, same as the frontend uses at
+    ``public/images/SP-Oil-Gas.png``) so the two stay visually
+    synchronised; then we fall back to a generic ``header.*`` name for
+    setups that prefer a single drop-in slot. Returning ``None`` is the
+    normal "no logo configured" case — the export shows a "[ Logos ]"
+    text placeholder instead.
+    """
+    base = Path(__file__).resolve().parent.parent.parent / "static" / "logos"
+    candidates = (
+        "SP-Oil-Gas.png", "SP-Oil-Gas.jpg", "SP-Oil-Gas.jpeg",
+        "header.png", "header.jpg", "header.jpeg",
+    )
+    for name in candidates:
+        p = base / name
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def _document_no(project: Project, workspace: str) -> str:
+    """Best-effort document number for the title block.
+
+    We don't know the contractor's exact numbering scheme, so we fall back
+    to ``<code> — <WORKSPACE> EQUIPMENT LIST``. Users can overwrite the
+    cell after download if they need the precise EPC document number.
+    """
+    code = (project.code or "").strip()
+    label = f"{workspace.upper()} EQUIPMENT LIST"
+    return f"{code} — {label}" if code else label
+
+
+class ExportFilter(BaseModel):
+    """Optional payload for the Excel export. When ``ids`` is non-empty,
+    the export is restricted to those equipment rows — used by the UI to
+    export exactly what the table is currently showing after filters.
+    Empty or absent ``ids`` exports everything in the workspace.
+    """
+    ids: list[int] | None = None
+
+
+@router.post("/projects/{project_id}/export/excel")
 async def export_excel(
     db: DbSession,
     project: Project = Depends(project_access("viewer")),
+    workspace: str | None = Query(
+        None,
+        regex="^(topside|marine)$",
+        description="Restrict the export to one workspace.",
+    ),
+    body: ExportFilter | None = Body(default=None),
 ):
-    rows = (
-        await db.execute(
-            select(Equipment).where(Equipment.project_id == project.id).order_by(Equipment.client_tag)
-        )
-    ).scalars().all()
+    """Download the project's equipment list as an .xlsx in the EPC
+    reference layout — title block top-right, multi-line bold headers,
+    module section banners, the 31-column structure identical to the
+    source template the contractor delivered.
+
+    POST (not GET) because the optional ``ids`` filter can carry hundreds
+    of integers — well past safe URL-length limits for a GET request.
+    The body is optional; calling with no body exports everything in
+    the (project, workspace) scope.
+    """
+    stmt = select(Equipment).where(Equipment.project_id == project.id)
+    if workspace:
+        stmt = stmt.where(Equipment.workspace == workspace)
+    if body and body.ids:
+        # Restrict to the explicit ID set the frontend sent. We keep the
+        # project + workspace filter on top so a user can't smuggle in IDs
+        # they don't have access to via project_access().
+        stmt = stmt.where(Equipment.id.in_(body.ids))
+    # Sort by module first so we can drop a banner row at the start of
+    # each group, then by client_tag inside each module — same order
+    # the reference workbook uses.
+    stmt = stmt.order_by(Equipment.module.asc().nullslast(), Equipment.client_tag.asc())
+    rows = (await db.execute(stmt)).scalars().all()
+
+    workspace_label = (workspace or project.project_type or "topside").lower()
+    is_marine = workspace_label == "marine"
+    title = "MARINE EQUIPMENT LIST" if is_marine else "TOPSIDES EQUIPMENT LIST"
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "EQUIPMENT LIST"
+    n_cols = len(EXPORT_COLUMNS)
 
-    # Header banner
-    ws.append([f"{project.project_type.upper()} EQUIPMENT LIST"])
-    ws.append([f"Project: {project.name}"])
-    ws.append([f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z"])
-    ws.append([])
-    ws.append([h for _, h in EXPORT_COLUMNS])
+    # ── Title block (rows 1-4) ──────────────────────────────────────────
+    # Three regions on the same 4-row band:
+    #   1. Left:   reserved logo area (rows 1-4, columns A-F). Empty, but
+    #              bordered + sized so a project admin can paste in the
+    #              client / contractor / FPSO operator logos after download.
+    #   2. Centre: "TOPSIDES EQUIPMENT LIST" title, merged across rows 1-4
+    #              and columns G-X. Big, bold, centered.
+    #   3. Right:  Project metadata (COMPANY, PROJECT No., PROJECT, Doc No),
+    #              one row each, with label cells in Z:AB and value cells
+    #              in AC:AE. Bordered.
+
+    # 1) Logo area — merge + border. We attempt to embed a header image
+    # found under app/static/logos/. If none exists we leave the area
+    # blank with a "[ Logos ]" placeholder so the layout still looks
+    # right; just drop a PNG/JPG into that folder and every future
+    # export picks it up automatically.
+    ws.merge_cells(
+        start_row=1, start_column=_LOGO_COL_START,
+        end_row=_TITLE_BLOCK_ROWS, end_column=_LOGO_COL_END,
+    )
+    for r in range(1, _TITLE_BLOCK_ROWS + 1):
+        for c in range(_LOGO_COL_START, _LOGO_COL_END + 1):
+            ws.cell(row=r, column=c).border = _BOX_BORDER
+    logo_path = _find_header_logo()
+    if logo_path is not None:
+        try:
+            img = XLImage(str(logo_path))
+            # Scale to a fixed target HEIGHT that fits the 4-row title
+            # block, preserving the logo's natural aspect ratio so it
+            # doesn't get visually stretched. openpyxl sets `img.width`
+            # and `img.height` from the file by default, so we read
+            # those and rescale.
+            natural_w = img.width or 1
+            natural_h = img.height or 1
+            target_h = 90  # px — fits inside the ~110px title-block area
+            target_w = int(target_h * natural_w / natural_h)
+            img.width = target_w
+            img.height = target_h
+            # Anchor near the top-left of A1 with a small offset so the
+            # logo doesn't touch the cell borders.
+            img.anchor = "A1"
+            ws.add_image(img, "A1")
+        except Exception:
+            # openpyxl raises on unreadable / unsupported images. Fall
+            # back to the placeholder rather than failing the whole
+            # export.
+            logo_path = None
+    if logo_path is None:
+        placeholder = ws.cell(row=1, column=_LOGO_COL_START)
+        placeholder.value = "[ Logos ]"
+        placeholder.font = Font(italic=True, size=9, color="999999")
+        placeholder.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 2) Centered title — merged
+    ws.merge_cells(
+        start_row=1, start_column=_TITLE_COL_START,
+        end_row=_TITLE_BLOCK_ROWS, end_column=_TITLE_COL_END,
+    )
+    title_cell = ws.cell(row=1, column=_TITLE_COL_START)
+    title_cell.value = title
+    title_cell.font = Font(bold=True, size=18, color="1F4E78")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    for r in range(1, _TITLE_BLOCK_ROWS + 1):
+        for c in range(_TITLE_COL_START, _TITLE_COL_END + 1):
+            ws.cell(row=r, column=c).border = _BOX_BORDER
+
+    # 3) Project metadata block (top-right)
+    title_block = [
+        (1, "COMPANY",      project.client or ""),
+        (2, "PROJECT No.",  project.code or ""),
+        (3, "PROJECT",      project.name or ""),
+        (4, "Document No",  _document_no(project, workspace_label)),
+    ]
+    for row, label, value in title_block:
+        # Label (merged Z:AB)
+        ws.merge_cells(
+            start_row=row, start_column=_TITLE_LABEL_COL,
+            end_row=row, end_column=_TITLE_LABEL_END,
+        )
+        lc = ws.cell(row=row, column=_TITLE_LABEL_COL, value=label)
+        lc.font = Font(bold=True, size=10)
+        lc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        lc.fill = _TITLE_LABEL_FILL
+        for c in range(_TITLE_LABEL_COL, _TITLE_LABEL_END + 1):
+            ws.cell(row=row, column=c).border = _BORDER
+        # Value (merged AC:AE)
+        ws.merge_cells(
+            start_row=row, start_column=_TITLE_VALUE_COL,
+            end_row=row, end_column=_TITLE_VALUE_END,
+        )
+        vc = ws.cell(row=row, column=_TITLE_VALUE_COL, value=value)
+        vc.font = Font(size=10)
+        vc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        for c in range(_TITLE_VALUE_COL, _TITLE_VALUE_END + 1):
+            ws.cell(row=row, column=c).border = _BORDER
+
+    # Make the title band tall enough to breathe (matches the reference's
+    # ~30pt-per-row look — 4 rows × 28 = 112pt total).
+    for r in range(1, _TITLE_BLOCK_ROWS + 1):
+        ws.row_dimensions[r].height = 28
+
+    # ── Column headers (row 5) — multi-line, bold, filled, bordered ────
+    HEADER_ROW = 5
+    header_font = Font(bold=True, size=10)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for idx, (_, header_text, width) in enumerate(EXPORT_COLUMNS, start=1):
+        cell = ws.cell(row=HEADER_ROW, column=idx, value=header_text)
+        cell.font = header_font
+        cell.alignment = header_align
+        cell.fill = _HEADER_FILL
+        cell.border = _BORDER
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.row_dimensions[HEADER_ROW].height = 52
+
+    # AutoFilter on the column-header row — this is what gives every
+    # header the little dropdown arrow visible in the reference workbook
+    # (Data → Filter in Excel). The range covers the full data area;
+    # openpyxl extends it automatically when we add rows below.
+    last_col_letter = get_column_letter(n_cols)
+    ws.auto_filter.ref = f"A{HEADER_ROW}:{last_col_letter}{HEADER_ROW}"
+
+    # ── Data rows with module section banners ───────────────────────────
+    # `n_cols` was already computed above (it determines auto_filter.ref).
+    body_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    banner_align = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+    banner_font = Font(bold=True, size=11, color="006100")  # dark green on mint
+    body_font = Font(size=10)
+
+    current_row = HEADER_ROW + 1
+    last_module: str | None = None
     for eq in rows:
-        ws.append([getattr(eq, attr) for attr, _ in EXPORT_COLUMNS])
+        module = (eq.module or "—").strip()
+        if module != last_module:
+            # New module group — merged banner row spanning all data
+            # columns, like the reference does at the start of each
+            # section (e.g. "MD: FLARE KNOCK OUT DRUMS & PUMPS …").
+            banner_cell = ws.cell(row=current_row, column=1, value=f"MODULE {module}")
+            banner_cell.font = banner_font
+            banner_cell.alignment = banner_align
+            banner_cell.fill = _BANNER_FILL
+            ws.merge_cells(
+                start_row=current_row, start_column=1,
+                end_row=current_row, end_column=n_cols,
+            )
+            for c in range(1, n_cols + 1):
+                ws.cell(row=current_row, column=c).border = _BORDER
+            current_row += 1
+            last_module = module
+
+        for idx, (attr, _, _) in enumerate(EXPORT_COLUMNS, start=1):
+            val = _value_for_export(getattr(eq, attr) if attr else None)
+            cell = ws.cell(row=current_row, column=idx, value=val)
+            cell.alignment = body_align
+            cell.border = _BORDER
+            cell.font = body_font
+        current_row += 1
+
+    # Freeze the header band so scrolling keeps it visible while reviewing
+    # the equipment rows underneath.
+    ws.freeze_panes = ws.cell(row=HEADER_ROW + 1, column=1)
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    fname = f"{project.code or 'project'}_{project.project_type}_equipment_list.xlsx"
+    fname = f"{project.code or 'project'}_{workspace_label}_equipment_list.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
