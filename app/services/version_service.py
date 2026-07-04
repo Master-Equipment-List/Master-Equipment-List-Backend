@@ -58,6 +58,8 @@ TRACKED_FIELDS = [
     "dry_weight_mt", "operating_weight_mt", "hydrotest_weight_mt",
     "pid", "remarks", "total_dry_weight_mt", "total_operating_weight_mt",
     "lifecycle_status",
+    # Extra dims / design conditions captured from vendor drawings
+    "length_overall_m", "mdmt_c", "hydrostatic_test_press_barg", "insulation",
 ]
 
 

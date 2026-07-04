@@ -91,6 +91,27 @@ FIELD_HEADER_PATTERNS: dict[str, list[str]] = {
     "total_dry_weight_mt": ["total dry wt", "total dry weight"],
     "total_operating_weight_mt": ["total ope wt", "total operating weight"],
 
+    # Extra fields from vendor drawings — added so a re-imported Excel
+    # (whether it came from our own export or a contractor-authored
+    # workbook that includes these extended columns) preserves the
+    # values instead of dropping them.
+    "length_overall_m": [
+        "overall length", "l overall", "overall l",
+        "length overall", "l (overall)",
+    ],
+    "mdmt_c": [
+        "mdmt", "min design metal temp", "minimum design metal temp",
+        "min design metal temperature", "minimum design metal temperature",
+    ],
+    "hydrostatic_test_press_barg": [
+        "hydro test press", "hydrostatic test press", "hydrotest press",
+        "hydrostatic test pressure", "hydrotest pressure",
+    ],
+    "insulation": [
+        "insulation", "insulation type", "insulation & thickness",
+        "insulation thickness",
+    ],
+
     # Marine MEL lifecycle dropdowns — three adjacent columns. Each
     # equipment row marks ZERO or ONE (occasionally more) with a Y / X /
     # ✓ / "1" / the literal label. We capture each into its own virtual
@@ -267,6 +288,27 @@ def extract_equipment_rows(path: str, sheet_name: str | None = None) -> list[dic
             lc_flags.append("NEW")
         if lc_flags:
             row_data["lifecycle_status"] = " / ".join(lc_flags)
+
+        # Backfill TOTAL weights from per-unit × count(configuration).
+        # The reference EPC template stores DRY / OPE WT as per-unit and
+        # TOTAL DRY / TOTAL OPE WT as the installed weight. Many source
+        # workbooks leave the TOTAL columns blank when the config is
+        # "1 x 100%" (per-unit = total anyway) or leave them blank as
+        # a data-entry shortcut expecting the reader to compute. We
+        # backfill them here — but ONLY when the source cell is empty.
+        # If the source has an explicit TOTAL (even one that disagrees
+        # with per-unit × count, which sometimes happens for standby
+        # units), that value wins.
+        from app.services.quantity import compute_installed_weight, is_blank
+        cfg = row_data.get("configuration")
+        if is_blank(row_data.get("total_dry_weight_mt")):
+            computed = compute_installed_weight(row_data.get("dry_weight_mt"), cfg)
+            if computed is not None:
+                row_data["total_dry_weight_mt"] = computed
+        if is_blank(row_data.get("total_operating_weight_mt")):
+            computed = compute_installed_weight(row_data.get("operating_weight_mt"), cfg)
+            if computed is not None:
+                row_data["total_operating_weight_mt"] = computed
 
         # Preserve full row content in `data.raw` for forward compatibility
         full = {

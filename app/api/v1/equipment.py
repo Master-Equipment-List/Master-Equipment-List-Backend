@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
+from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -16,9 +17,10 @@ from sqlalchemy.exc import IntegrityError
 
 from app.deps import CurrentUser, DbSession, project_access
 from app.extractors.topside_excel import extract_equipment_rows
-from app.models import Equipment, Project
+from app.models import Equipment, EquipmentVersion, Project
 from app.schemas.equipment import EquipmentCreate, EquipmentOut, EquipmentUpdate
 from app.services import audit_service
+from app.services.quantity import compute_installed_weight, pick_effective_total
 from app.services.version_service import apply_update, record_initial_version
 
 router = APIRouter()
@@ -253,10 +255,19 @@ EXPORT_COLUMNS: list[tuple[str, str, int]] = [
     ("height_tt_m",               "H or T/T\n(m)",                        9),
     ("dry_weight_mt",             "DRY WT       in MT",                   12),
     ("operating_weight_mt",       "OPE WT in MT",                         12),
+    ("hydrotest_weight_mt",       "HYDROTEST WT\nin MT",                  14),
     ("pid",                       "P&ID",                                 24),
     ("remarks",                   "REMARKS",                              22),
     ("total_dry_weight_mt",       "TOTAL DRY WT\nin mT",                  12),
     ("total_operating_weight_mt", "TOTAL OPE WT\nin mT",                  12),
+    ("lifecycle_status",          "LIFECYCLE",                            14),
+    # Extra fields from vendor drawings — appended after the reference-
+    # matching layout so the first 31 columns stay identical to the
+    # contractor's template.
+    ("length_overall_m",          "OVERALL LENGTH\n(m)",                  12),
+    ("mdmt_c",                    "MDMT\n(oC)",                           10),
+    ("hydrostatic_test_press_barg", "HYDRO TEST PRESS\n(barg)",           14),
+    ("insulation",                "INSULATION",                           22),
 ]
 
 # Header layout — mirrors the reference EPC workbook
@@ -289,6 +300,14 @@ _TITLE_BLOCK_ROWS = 4 # rows 1-4
 _HEADER_FILL = PatternFill("solid", fgColor="FFF2CC")  # pale yellow — column headers
 _BANNER_FILL = PatternFill("solid", fgColor="C6EFCE")  # mint green   — module banners
 _TITLE_LABEL_FILL = PatternFill("solid", fgColor="F2F2F2")  # light grey — title-block labels
+# Version-rank highlighting: cells whose value came from the CURRENT
+# equipment version get GREEN; cells last touched by the PREVIOUS
+# version get ORANGE. Older changes and initial-creation cells stay
+# white so the sheet only calls attention to the two most recent moves.
+_LATEST_FILL = PatternFill("solid", fgColor="C6EFCE")  # Excel "Good"    — green
+_LATEST_FONT_COLOR = "006100"
+_SECOND_FILL = PatternFill("solid", fgColor="FFCC99")  # soft orange
+_SECOND_FONT_COLOR = "974706"
 _THIN  = Side(style="thin",  color="999999")
 _MED   = Side(style="medium", color="000000")
 _BORDER     = Border(top=_THIN, left=_THIN, right=_THIN, bottom=_THIN)
@@ -333,6 +352,48 @@ def _find_header_logo() -> Path | None:
     return None
 
 
+_SOURCE_LABEL = {
+    "manual": "Manual edit",
+    "excel":  "Excel import",
+    "pfd":    "PFD sync",
+    "pid":    "P&ID sync",
+    "vendor": "Vendor sync",
+    "seed":   "Initial seed",
+}
+
+
+def _make_change_comment(change: dict[str, Any]) -> Comment:
+    """Build the hover-comment for a highlighted cell.
+
+    ``change`` is the dict we stashed in ``highlight_map`` — the latest
+    ``EquipmentVersion`` row (within the highlight window) that touched
+    the field this cell renders. Example text::
+
+        Changed in v3
+        Source: Vendor sync
+        When:   2026-06-30 14:20 UTC
+
+    Author is set to "MEL" so the Excel comment sidebar labels these
+    consistently, distinct from any comments a human might add after
+    download.
+    """
+    when = change.get("created_at")
+    when_str = when.strftime("%Y-%m-%d %H:%M UTC") if isinstance(when, datetime) else "—"
+    source_raw = str(change.get("source") or "").lower()
+    source_label = _SOURCE_LABEL.get(source_raw, source_raw or "—")
+    text = (
+        f"Changed in v{change.get('version_no', '?')}\n"
+        f"Source: {source_label}\n"
+        f"When:   {when_str}"
+    )
+    c = Comment(text, "MEL")
+    # Give the comment enough real estate that the three lines don't wrap
+    # awkwardly the first time a user hovers. Excel treats these as pt.
+    c.width = 240
+    c.height = 80
+    return c
+
+
 def _document_no(project: Project, workspace: str) -> str:
     """Best-effort document number for the title block.
 
@@ -363,6 +424,15 @@ async def export_excel(
         regex="^(topside|marine)$",
         description="Restrict the export to one workspace.",
     ),
+    highlight: bool = Query(
+        True,
+        description=(
+            "If true (default), cells set by the current equipment version "
+            "are filled green and cells last set by the previous version "
+            "are filled orange. Older changes stay white. Set false for a "
+            "pristine EPC-format export with no coloring."
+        ),
+    ),
     body: ExportFilter | None = Body(default=None),
 ):
     """Download the project's equipment list as an .xlsx in the EPC
@@ -388,6 +458,63 @@ async def export_excel(
     # the reference workbook uses.
     stmt = stmt.order_by(Equipment.module.asc().nullslast(), Equipment.client_tag.asc())
     rows = (await db.execute(stmt)).scalars().all()
+
+    # Version-rank highlighting.
+    #
+    # Per equipment, we identify the two most-recent NON-INITIAL versions
+    # (version_no >= 2 — the seed / first-create snapshot at v1 has
+    # `changed_fields = ALL_TRACKED_FIELDS`, so counting it would turn
+    # every field on a fresh row green and defeat the point).
+    #
+    # For each equipment we build:
+    #   latest_change[eq_id] -> {version_no, source, created_at, fields}
+    #   second_change[eq_id] -> {…} or absent
+    #
+    # In the cell loop we colour a cell:
+    #   • GREEN  if its attr is in latest_change[eq.id]["fields"]
+    #   • ORANGE elif its attr is in second_change[eq.id]["fields"]
+    #   • no fill otherwise
+    #
+    # A field that changed in v2, then again in v4 — with v5 being
+    # current but not touching it — will show up as ORANGE (last actual
+    # move to that value was v4, which is the previous non-initial
+    # version) rather than green. That matches the user's intuition:
+    # "orange = one behind the newest change".
+    latest_change: dict[int, dict[str, Any]] = {}
+    second_change: dict[int, dict[str, Any]] = {}
+    if highlight and rows:
+        v_stmt = (
+            select(
+                EquipmentVersion.equipment_id,
+                EquipmentVersion.version_no,
+                EquipmentVersion.changed_fields,
+                EquipmentVersion.source,
+                EquipmentVersion.created_at,
+            )
+            .where(
+                EquipmentVersion.equipment_id.in_([r.id for r in rows]),
+                EquipmentVersion.version_no >= 2,
+            )
+            .order_by(
+                EquipmentVersion.equipment_id.asc(),
+                EquipmentVersion.version_no.desc(),  # newest first per equipment
+            )
+        )
+        for eq_id, ver_no, changed, source, created_at in (await db.execute(v_stmt)).all():
+            if not changed:
+                continue
+            entry = {
+                "version_no": ver_no,
+                "source": source,
+                "created_at": created_at,
+                "fields": set(changed),
+            }
+            if eq_id not in latest_change:
+                latest_change[eq_id] = entry
+            elif eq_id not in second_change:
+                second_change[eq_id] = entry
+            # else: already have the top two; keep scanning is cheap and
+            # short-circuiting per-eq isn't worth the added complexity.
 
     workspace_label = (workspace or project.project_type or "topside").lower()
     is_marine = workspace_label == "marine"
@@ -547,12 +674,53 @@ async def export_excel(
             current_row += 1
             last_module = module
 
+        latest = latest_change.get(eq.id)
+        second = second_change.get(eq.id)
+        latest_fields: set[str] = latest["fields"] if latest else set()
+        second_fields: set[str] = second["fields"] if second else set()
+        # Fill missing TOTAL WT columns from DRY/OPE × count(CONFIGURATION).
+        # The reference EPC template treats DRY WT as per-unit weight and
+        # TOTAL DRY WT as the installed weight (per-unit × units-in-config,
+        # e.g. "2 x 100%" → ×2). When the DB has DRY but no TOTAL, we
+        # substitute the computed value so the workbook always has a
+        # sensible TOTAL column for downstream consumers.
+        computed_total_dry = compute_installed_weight(
+            eq.dry_weight_mt, eq.configuration,
+        )
+        computed_total_ope = compute_installed_weight(
+            eq.operating_weight_mt, eq.configuration,
+        )
+        effective_total_dry = pick_effective_total(
+            eq.total_dry_weight_mt, computed_total_dry,
+        )
+        effective_total_ope = pick_effective_total(
+            eq.total_operating_weight_mt, computed_total_ope,
+        )
         for idx, (attr, _, _) in enumerate(EXPORT_COLUMNS, start=1):
-            val = _value_for_export(getattr(eq, attr) if attr else None)
+            if attr == "total_dry_weight_mt":
+                raw = effective_total_dry
+            elif attr == "total_operating_weight_mt":
+                raw = effective_total_ope
+            else:
+                raw = getattr(eq, attr) if attr else None
+            val = _value_for_export(raw)
             cell = ws.cell(row=current_row, column=idx, value=val)
             cell.alignment = body_align
             cell.border = _BORDER
-            cell.font = body_font
+            # GREEN if the current version touched this field; ORANGE
+            # if it wasn't in the current version but was in the one
+            # before it; no fill otherwise. Hover-comment names the
+            # exact version that owns each colour.
+            if attr and attr in latest_fields:
+                cell.fill = _LATEST_FILL
+                cell.font = Font(size=10, bold=True, color=_LATEST_FONT_COLOR)
+                cell.comment = _make_change_comment(latest)
+            elif attr and attr in second_fields:
+                cell.fill = _SECOND_FILL
+                cell.font = Font(size=10, bold=True, color=_SECOND_FONT_COLOR)
+                cell.comment = _make_change_comment(second)
+            else:
+                cell.font = body_font
         current_row += 1
 
     # Freeze the header band so scrolling keeps it visible while reviewing
@@ -583,6 +751,7 @@ _IMPORTABLE_FIELDS = [
     "dry_weight_mt", "operating_weight_mt", "hydrotest_weight_mt",
     "pid", "remarks", "total_dry_weight_mt", "total_operating_weight_mt",
     "lifecycle_status",
+    "length_overall_m", "mdmt_c", "hydrostatic_test_press_barg", "insulation",
 ]
 
 

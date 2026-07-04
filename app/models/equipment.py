@@ -73,6 +73,29 @@ class Equipment(Base, TimestampMixin):
     total_dry_weight_mt: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_operating_weight_mt: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Extra fields captured from vendor drawings — kept as free strings
+    # (like every other engineering-doc field) so ranges / units / notes
+    # survive the round-trip:
+    #   * length_overall_m — DISTINCT from length_m. length_m holds the
+    #     T/T (tangent-to-tangent) length used by the EPC MEL template;
+    #     length_overall_m holds the drawing's OVERALL length
+    #     (flange-face to flange-face, including heads/nozzles). Only
+    #     applies to horizontal vessels where the two differ; for other
+    #     equipment types it will typically stay NULL and length_m alone
+    #     is used.
+    #   * mdmt_c — Minimum Design Metal Temperature. Historically packed
+    #     into `design_temp` as a range like ``"-40 / 120"``; splitting
+    #     it out makes low-temp filtering + hot-side sorting trivial.
+    #   * hydrostatic_test_press_barg — hydrotest pressure, printed on
+    #     every ASME VIII vessel drawing.
+    #   * insulation — free-text combining type + thickness, e.g.
+    #     ``"40 mm personal protection"`` or
+    #     ``"75 mm mineral wool, cladding SS304"``.
+    length_overall_m: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mdmt_c: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hydrostatic_test_press_barg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    insulation: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Marine MEL lifecycle flag — the source workbook has three adjacent
     # dropdown columns ("SCRAPPED", "REFURBISHED", "NEW") and each
     # equipment row ticks ZERO OR ONE of them (occasionally more on

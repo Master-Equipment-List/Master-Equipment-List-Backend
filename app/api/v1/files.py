@@ -267,3 +267,86 @@ async def delete_file(
     await db.commit()
     # 204 No Content
     return None
+
+
+class BulkDeleteFilesRequest(BaseModel):
+    ids: list[int]
+
+
+@router.post("/projects/{project_id}/files/bulk-delete")
+async def bulk_delete_files(
+    payload: BulkDeleteFilesRequest,
+    db: DbSession,
+    user: CurrentUser,
+    project: Project = Depends(project_access("editor")),
+):
+    """Delete many project files in one transaction.
+
+    Same per-file semantics as ``DELETE /projects/{project_id}/files/{file_id}``:
+    removes the row, cascade-deletes its extractions, best-effort deletes
+    the local cached copy. Only rows belonging to ``project_id`` are
+    touched, so a stale UI can't wipe files from other projects. Returns
+    ``{deleted, not_found, local_removed}`` for a summary toast.
+    """
+    if not payload.ids:
+        return {"deleted": 0, "not_found": 0, "local_removed": 0}
+
+    rows = (
+        await db.execute(
+            select(ProjectFile).where(
+                ProjectFile.id.in_(payload.ids),
+                ProjectFile.project_id == project.id,
+            )
+        )
+    ).scalars().all()
+    found_ids = {r.id for r in rows}
+    not_found = len([i for i in payload.ids if i not in found_ids])
+
+    snaps = [
+        {
+            "id": r.id,
+            "name": r.name,
+            "onedrive_item_id": r.onedrive_item_id,
+            "onedrive_path": r.onedrive_path,
+            "folder_category": r.folder_category,
+            "size_bytes": r.size_bytes,
+            "local_path": r.local_path,
+        }
+        for r in rows
+    ]
+
+    for r in rows:
+        await db.delete(r)
+    await db.flush()
+
+    local_removed = 0
+    for snap in snaps:
+        lp = snap["local_path"]
+        if not lp:
+            continue
+        try:
+            p = Path(lp)
+            if p.exists() and p.is_file():
+                p.unlink()
+                local_removed += 1
+        except OSError:
+            pass
+
+    await audit_service.log(
+        db,
+        action="file.bulk_delete",
+        user_id=user.id,
+        project_id=project.id,
+        metadata={
+            "deleted": len(found_ids),
+            "not_found": not_found,
+            "local_removed": local_removed,
+            "files": snaps,
+        },
+    )
+    await db.commit()
+    return {
+        "deleted": len(found_ids),
+        "not_found": not_found,
+        "local_removed": local_removed,
+    }

@@ -424,7 +424,33 @@ async def _apply_vendor_updates(
     extraction.data = new_data
 
     tag = mapping.get("client_equipment_tag")
-    fields = {k: v for k, v in (mapping.get("fields") or {}).items() if v}
+    raw_fields = mapping.get("fields") or {}
+    evidence = mapping.get("evidence") or {}
+
+    # Confidence gate — silently drop every field the mapper marked as
+    # "low" confidence. The mapper uses "low" specifically when it found
+    # a value but couldn't tie it to an explicit label (e.g. a bare 795
+    # in a revision cloud on a heater bundle drawing). We don't want
+    # these to auto-apply; we want them to sit in the extraction JSON
+    # under `evidence[field].not_found_reason` for reviewer inspection.
+    # High + medium extractions apply. NULL values are dropped normally.
+    fields: dict[str, Any] = {}
+    low_confidence_dropped: list[str] = []
+    for k, v in raw_fields.items():
+        if not v:
+            continue
+        conf = ((evidence.get(k) or {}).get("confidence") or "").lower()
+        if conf == "low":
+            low_confidence_dropped.append(k)
+            continue
+        fields[k] = v
+
+    if summary is not None and low_confidence_dropped:
+        summary["vendor_low_confidence_skips"] = (
+            (summary.get("vendor_low_confidence_skips") or 0)
+            + len(low_confidence_dropped)
+        )
+
     if not tag or not fields:
         return 0
 
@@ -667,6 +693,11 @@ async def run_sync(
         # source (P&ID) had already set the row. Helps users understand
         # why PFD/Vendor updates didn't take effect this sync.
         "pid_locked_skips": 0,
+        # Fields the vendor mapper flagged as "low confidence" (couldn't
+        # tie the value to an explicit label) — held back from auto-apply
+        # so the reviewer sees the not_found_reason in the extraction
+        # JSON and can decide whether to enter the value manually.
+        "vendor_low_confidence_skips": 0,
         "errors": [],
     }
 
@@ -720,6 +751,11 @@ async def sync_single_item(
         # source (P&ID) had already set the row. Helps users understand
         # why PFD/Vendor updates didn't take effect this sync.
         "pid_locked_skips": 0,
+        # Fields the vendor mapper flagged as "low confidence" (couldn't
+        # tie the value to an explicit label) — held back from auto-apply
+        # so the reviewer sees the not_found_reason in the extraction
+        # JSON and can decide whether to enter the value manually.
+        "vendor_low_confidence_skips": 0,
         "errors": [],
     }
 

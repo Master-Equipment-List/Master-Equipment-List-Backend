@@ -39,6 +39,11 @@ class EquipmentBase(BaseModel):
     total_dry_weight_mt: str | None = None
     total_operating_weight_mt: str | None = None
     lifecycle_status: str | None = None
+    # Extra fields captured from vendor drawings
+    length_overall_m: str | None = None
+    mdmt_c: str | None = None
+    hydrostatic_test_press_barg: str | None = None
+    insulation: str | None = None
 
 
 class EquipmentCreate(EquipmentBase):
@@ -78,6 +83,10 @@ class EquipmentUpdate(BaseModel):
     total_dry_weight_mt: str | None = None
     total_operating_weight_mt: str | None = None
     lifecycle_status: str | None = None
+    length_overall_m: str | None = None
+    mdmt_c: str | None = None
+    hydrostatic_test_press_barg: str | None = None
+    insulation: str | None = None
     data: dict[str, Any] | None = None
     note: str | None = None
 
