@@ -63,7 +63,7 @@ import re
 from typing import Any
 
 from app.config import settings
-from app.services._shared_client import get_openai_client
+from app.services._shared_client import get_anthropic_client
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ Here is the vision JSON:
 
 
 def is_enabled() -> bool:
-    return bool(settings.OPENAI_API_KEY)
+    return bool(settings.ANTHROPIC_API_KEY)
 
 
 def _strip_json_fences(text: str) -> str:
@@ -201,7 +201,7 @@ def _parse_json(text: str) -> dict[str, Any] | None:
 
 
 def map_pid_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Send the raw P&ID vision JSON to the LLM and ask for the equipment
+    """Send the raw P&ID vision JSON to Claude and ask for the equipment
     tag(s), refined MEL fields, plus ancillary line/instrument/nozzle data.
 
     Returns ``None`` only if the LLM call fails entirely; otherwise always
@@ -216,26 +216,30 @@ def map_pid_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | None:
         payload = payload[:220_000] + "\n...[truncated]"
 
     try:
-        client = get_openai_client()
+        client = get_anthropic_client()
     except RuntimeError:
-        log.warning("openai SDK not installed; P&ID field mapping disabled")
+        log.warning("anthropic SDK not installed; P&ID field mapping disabled")
         return None
     try:
-        resp = client.chat.completions.create(
+        resp = client.messages.create(
             model=settings.VISION_MODEL,
             max_tokens=6144,
             temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": MAPPER_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(payload)},
-            ],
+            system=[{
+                "type": "text",
+                "text": MAPPER_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role": "user",
+                "content": [{"type": "text", "text": _build_user_prompt(payload)}],
+            }],
         )
     except Exception as e:  # noqa: BLE001
         log.warning("P&ID field mapper call failed: %s", e)
         return None
 
-    text = resp.choices[0].message.content or ""
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
     parsed = _parse_json(text) or {}
 
     out_equipment: list[dict[str, Any]] = []

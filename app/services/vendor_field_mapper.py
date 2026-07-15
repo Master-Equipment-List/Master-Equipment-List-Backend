@@ -1,7 +1,7 @@
 """LLM-based vendor-data field mapper.
 
 The vision extractor (``vision_pfd_service``) is deliberately format-agnostic:
-it returns whatever JSON the LLM produces for each page of the PDF, with no
+it returns whatever JSON Claude produces for each page of the PDF, with no
 fixed schema. That's great for human review but means the project can't
 auto-apply field updates the way it used to.
 
@@ -56,7 +56,7 @@ import re
 from typing import Any
 
 from app.config import settings
-from app.services._shared_client import get_openai_client
+from app.services._shared_client import get_anthropic_client
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ TARGET_FIELDS = [
 # The map's KEYS are canonical type names we pass into the mapper prompt.
 # Each entry lists trigger keywords (matched case-insensitively) and a
 # dimension guide the mapper injects into the "Rules" section of the
-# prompt so the LLM knows what "length_m" / "width_id_m" / "height_tt_m"
+# prompt so Claude knows what "length_m" / "width_id_m" / "height_tt_m"
 # actually mean for THIS type of drawing.
 
 _TYPE_RULES: dict[str, dict[str, Any]] = {
@@ -191,7 +191,7 @@ def _detect_equipment_type(vision_pages: list[dict[str, Any]]) -> str:
     the concatenated overview text; returns the winner or "generic" if
     nothing scored.
 
-    This is deliberately keyword-based, not an extra the LLM call — an
+    This is deliberately keyword-based, not an extra Claude call — an
     extra API round-trip per PDF would double the mapper cost for a
     step the drawing title reliably answers on its own.
     """
@@ -283,7 +283,7 @@ def _build_user_prompt(vision_pages_json: str, equipment_type: str) -> str:
 
     ``equipment_type`` is one of the canonical types in ``_TYPE_RULES``
     ("vessel", "heater", …) — the guide for L/W/H is inserted directly
-    so the LLM has the correct definition for THIS drawing.
+    so Claude has the correct definition for THIS drawing.
     """
     dim_guide = _dimension_guide(equipment_type)
     return f"""I'm giving you the JSON that came out of a vision pass over EVERY
@@ -507,7 +507,7 @@ Here is the vision JSON:
 
 
 def is_enabled() -> bool:
-    return bool(settings.OPENAI_API_KEY)
+    return bool(settings.ANTHROPIC_API_KEY)
 
 
 def _strip_json_fences(text: str) -> str:
@@ -556,7 +556,7 @@ def _normalize_evidence_entry(raw: Any) -> dict[str, Any]:
 
 
 def map_vendor_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Send the raw vision JSON to the LLM and ask for the equipment tag,
+    """Send the raw vision JSON to Claude and ask for the equipment tag,
     the 15 target MEL fields, and per-field evidence (confidence + source
     location + not-found reason).
 
@@ -574,36 +574,40 @@ def map_vendor_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | No
     payload = json.dumps({"pages": vision_pages}, ensure_ascii=False)
     # Cap payload size — the vision JSON for a vendor sheet is rarely huge,
     # but vendor PDFs with many pages × many tiles can balloon. 200k chars is
-    # comfortably within the LLM's context window without bloating cost.
+    # comfortably within Claude's context window without bloating cost.
     if len(payload) > 200_000:
         payload = payload[:200_000] + "\n...[truncated]"
 
     try:
-        client = get_openai_client()
+        client = get_anthropic_client()
     except RuntimeError:
-        log.warning("openai SDK not installed; vendor field mapping disabled")
+        log.warning("anthropic SDK not installed; vendor field mapping disabled")
         return None
     try:
-        resp = client.chat.completions.create(
+        resp = client.messages.create(
             model=settings.VISION_MODEL,
             # 2048 was tight even before evidence — 15 fields × ~3 lines
             # each was ~1400 tokens; adding evidence brings the payload
             # to ~2400. Bump to 4096 with headroom.
             max_tokens=4096,
             temperature=0,
-            # Force JSON output at the API level — GPT-4o will retry
-            # internally until it produces well-formed JSON.
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": MAPPER_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(payload, equipment_type)},
-            ],
+            system=[{
+                "type": "text",
+                "text": MAPPER_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role": "user",
+                "content": [{"type": "text", "text": _build_user_prompt(payload, equipment_type)}],
+            }],
         )
     except Exception as e:  # noqa: BLE001
         log.warning("Vendor field mapper call failed: %s", e)
         return None
 
-    text = resp.choices[0].message.content or ""
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    )
     parsed = _parse_json(text) or {}
 
     # Normalize the shape — guarantee every target field is present (null is fine).

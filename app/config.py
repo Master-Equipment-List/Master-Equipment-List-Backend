@@ -61,30 +61,24 @@ class Settings(BaseSettings):
     # Where to send the user after the OneDrive OAuth callback finishes.
     FRONTEND_BASE_URL: str = "http://localhost:3000"
 
-    # OpenAI vision — when set, the PFD/Vendor extractors prefer
-    # GPT-4o vision over OCR. Falls back to OCR if unset or on failure.
-    OPENAI_API_KEY: str = ""
-    VISION_MODEL: str = "gpt-4o"
+    # Anthropic vision — when set, the PFD/Vendor extractors prefer
+    # Claude vision over OCR. Falls back to OCR if unset or on failure.
+    ANTHROPIC_API_KEY: str = ""
+    VISION_MODEL: str = "claude-sonnet-4-5-20250929"
     # Cap pages we send to vision per PDF (cost + latency control). Set
     # high enough that typical vendor data sheets (2-10 pages) and PFD
     # bundles (5-20 pages) are captured in full. Set to 0 for unlimited.
     VISION_MAX_PAGES: int = 50
     # Render DPI for the page image we send to vision. Higher = more
-    # readable small text, but slower + larger images. GPT-4o resizes
-    # incoming images to a 2048×2048 max internally, so anything beyond
-    # ~300 DPI is wasted bandwidth on typical A1 landscape pages.
-    VISION_RENDER_DPI: int = 300
-    # Geometric tiling grid sent with each page (no semantic crops).
-    # Set both to 1 to disable tiling (overview only) — RECOMMENDED FOR
-    # OPENAI. GPT-4o's `detail: "high"` mode already tiles the image
-    # internally into 512×512 patches, so external tiling multiplies
-    # API calls (and cost) without adding information the model uses.
-    # For Claude Sonnet 4.5 (which does NOT internally tile) the old
-    # 3×2 grid was helpful; for GPT-4o, 1×1 is 7× fewer API calls per
-    # page with no accuracy loss on standard vendor drawings. Override
-    # in .env if a particular document type needs external tiling.
-    VISION_TILE_COLS: int = 1
-    VISION_TILE_ROWS: int = 1
+    # readable small text, but slower + larger images. 400 is a good
+    # default for A1 engineering drawings.
+    VISION_RENDER_DPI: int = 400
+    # Geometric tiling grid sent with each page (no semantic crops). The
+    # full page is ALWAYS sent as an overview image; tiles are extra
+    # high-resolution slices used to read small text. Set both to 1 to
+    # disable tiling (overview only).
+    VISION_TILE_COLS: int = 3
+    VISION_TILE_ROWS: int = 2
 
     @property
     def cors_origins(self) -> List[str]:

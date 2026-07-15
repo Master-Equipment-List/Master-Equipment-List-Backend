@@ -7,7 +7,7 @@ Two-stage pipeline:
 
 The first stage stays free of any project-specific schema. The second stage
 is where the MEL business requirement (the eight specific columns) lives.
-No regex, no fixed positions — the LLM does the semantic mapping.
+No regex, no fixed positions — Claude does the semantic mapping.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def extract_vendor_data(source_path: str | None) -> dict[str, Any] | None:
     Output shape:
         {
           "pages": [...],                   # raw vision JSON, for review
-          "client_equipment_tag": str|None, # what the LLM identified
+          "client_equipment_tag": str|None, # what Claude identified
           "fields": {                       # eight target MEL columns
             "absorbed_power_kw":     str|None,
             "rated_power_kw":        str|None,

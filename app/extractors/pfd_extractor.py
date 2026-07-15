@@ -30,7 +30,7 @@ def extract_pfd(
 
     Output shape (NOT a fixed schema — pages[*] varies per document):
         {
-          "pages": [<raw per-page JSON from the LLM>, ...],
+          "pages": [<raw per-page JSON from Claude>, ...],
           "pfd_updates": {},      # always empty — no auto-apply
           "tags_found": [],       # always empty — no inference
           "_source": "vision" | "vision_disabled" | "vision_failed"
