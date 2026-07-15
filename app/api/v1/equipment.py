@@ -483,6 +483,14 @@ async def export_excel(
     latest_change: dict[int, dict[str, Any]] = {}
     second_change: dict[int, dict[str, Any]] = {}
     if highlight and rows:
+        # Exclude source="repair" — that's the tag for internal backfills
+        # (e.g. the lifecycle_status one-off), not a real vendor / PFD /
+        # P&ID sync. Letting repair rows into the highlight query causes
+        # them to steal the "latest change" slot on every equipment row
+        # they touched, hiding the actual engineering-doc-driven changes
+        # underneath. Real syncs use source in ('pfd', 'pid', 'vendor',
+        # 'excel', 'manual') — those are what a reviewer wants to see
+        # coloured.
         v_stmt = (
             select(
                 EquipmentVersion.equipment_id,
@@ -494,6 +502,7 @@ async def export_excel(
             .where(
                 EquipmentVersion.equipment_id.in_([r.id for r in rows]),
                 EquipmentVersion.version_no >= 2,
+                EquipmentVersion.source != "repair",
             )
             .order_by(
                 EquipmentVersion.equipment_id.asc(),
@@ -676,8 +685,25 @@ async def export_excel(
 
         latest = latest_change.get(eq.id)
         second = second_change.get(eq.id)
-        latest_fields: set[str] = latest["fields"] if latest else set()
-        second_fields: set[str] = second["fields"] if second else set()
+        latest_fields: set[str] = set(latest["fields"]) if latest else set()
+        second_fields: set[str] = set(second["fields"]) if second else set()
+
+        # Propagate colouring from DRY/OPE WT to the computed TOTAL WT
+        # columns. `total_dry_weight_mt` / `total_operating_weight_mt`
+        # are rendered in the export as `per_unit × count(CONFIG)` when
+        # the stored TOTAL is blank, so when a sync updates the per-unit
+        # value the TOTAL cell also visually changes — but the sync's
+        # `changed_fields` list only names the per-unit field, so
+        # without this propagation the TOTAL cell would stay uncoloured
+        # even though its displayed value did change.
+        if "dry_weight_mt" in latest_fields:
+            latest_fields.add("total_dry_weight_mt")
+        if "operating_weight_mt" in latest_fields:
+            latest_fields.add("total_operating_weight_mt")
+        if "dry_weight_mt" in second_fields:
+            second_fields.add("total_dry_weight_mt")
+        if "operating_weight_mt" in second_fields:
+            second_fields.add("total_operating_weight_mt")
         # Fill missing TOTAL WT columns from DRY/OPE × count(CONFIGURATION).
         # The reference EPC template treats DRY WT as per-unit weight and
         # TOTAL DRY WT as the installed weight (per-unit × units-in-config,

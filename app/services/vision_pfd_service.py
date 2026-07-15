@@ -1,16 +1,16 @@
-"""Format-agnostic vision-based PDF extraction via Claude.
+"""Format-agnostic vision-based PDF extraction via the LLM.
 
 Design principle (per user mandate): this module contains NO domain schema,
 NO fixed crop regions, NO assumed row/column labels, NO regex patterns for
 specific fields, and NO MEL-shaped output. Every page is rendered as a single
-image and passed to Claude with one generic prompt asking the model to return
+image and passed to the LLM with one generic prompt asking the model to return
 whatever it sees as JSON. The shape of the output adapts to whatever the
 document contains — different drawings produce different shapes, by design.
 
 Two public entry points are preserved for backwards compatibility with the
 existing extractor/sync wiring, but both now return the same raw generic
 JSON: a dict with a single ``pages`` key whose value is a list of per-page
-JSON objects exactly as Claude returned them.
+JSON objects exactly as the LLM returned them.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 # Re-export the shared singleton so callers can still call _get_client().
-from app.services._shared_client import get_anthropic_client as _get_client  # noqa: E402
+from app.services._shared_client import get_openai_client as _get_client  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ explanations."""
 
 def is_enabled() -> bool:
     """True when an API key is configured (vision is opt-in via .env)."""
-    return bool(settings.ANTHROPIC_API_KEY)
+    return bool(settings.OPENAI_API_KEY)
 
 
 def _render_pages(pdf_path: str | Path, max_pages: int, dpi: int) -> list:
@@ -101,13 +101,16 @@ def _render_pages(pdf_path: str | Path, max_pages: int, dpi: int) -> list:
     return convert_from_path(str(pdf_path), dpi=dpi, **kwargs)
 
 
-# Anthropic's vision API rejects images with any dimension > 8000 px.
-# A1 landscape engineering drawings at 400 DPI go to ~9300 × 6600 — well
-# over that limit on the long edge. We pre-resize to fit so the call
-# doesn't 400. The model resizes its input internally anyway (long edge
-# clamped to ~1568 px), so capping at MAX_IMAGE_DIM doesn't lose
-# information that wasn't going to be used.
-MAX_IMAGE_DIM = 7800  # leave a small safety margin under 8000
+# OpenAI's GPT-4o vision resizes any image to fit inside a 2048×2048
+# square (aspect-preserving) BEFORE processing, then samples at 512×512
+# tiles for high-detail mode. Sending images larger than 2048 wastes
+# bandwidth without adding information — the model won't see the extra
+# pixels. A1 landscape engineering drawings at 400 DPI render to
+# ~9300×6600, so we pre-resize to 2048 max dimension. Tiling
+# (VISION_TILE_COLS × VISION_TILE_ROWS) still gives the model higher
+# effective resolution on small text — each tile is a sub-region
+# rendered independently, then downscaled to 2048 for the API.
+MAX_IMAGE_DIM = 2048
 
 
 def _image_to_b64(img) -> str:
@@ -171,8 +174,9 @@ def _tile_image(img, cols: int, rows: int, overlap_frac: float = 0.04) -> list:
     return tiles
 
 
-def _call_claude_on_image(img, label: str) -> dict[str, Any]:
-    """Send a SINGLE image to Claude with the generic prompt.
+def _call_llm_on_image(img, label: str) -> dict[str, Any]:
+    """Send a SINGLE image to the LLM (OpenAI GPT-4o) with the generic
+    extraction prompt.
 
     Always returns a dict — never None — so the caller can record failures
     in the page output instead of silently losing content.
@@ -180,57 +184,62 @@ def _call_claude_on_image(img, label: str) -> dict[str, Any]:
     try:
         client = _get_client()
     except RuntimeError:
-        return {"_label": label, "_extraction_error": "anthropic_sdk_missing"}
+        return {"_label": label, "_extraction_error": "openai_sdk_missing"}
 
+    # OpenAI image format: image_url with a data URL. `detail: "high"`
+    # tells GPT-4o to sample the image at 512×512 tiles for maximum
+    # accuracy on small engineering-drawing text (title-block IDs,
+    # dimension labels, etc.). Without "high" it downsamples to a single
+    # 512×512 patch, which is too coarse for A1 drawings.
     image_block = {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": "image/png",
-            "data": _image_to_b64(img),
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:image/png;base64,{_image_to_b64(img)}",
+            "detail": "high",
         },
     }
     try:
-        resp = client.messages.create(
+        resp = client.chat.completions.create(
             model=settings.VISION_MODEL,
             max_tokens=8192,
             temperature=0,
-            system=[{
-                "type": "text",
-                "text": GENERIC_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{
-                "role": "user",
-                "content": [
-                    image_block,
-                    {"type": "text", "text": GENERIC_USER_PROMPT},
-                ],
-            }],
+            # Force JSON output at the API level — GPT-4o will reject its
+            # own completion if the response isn't valid JSON, retrying
+            # internally until it produces well-formed JSON. Complements
+            # our prompt's "Return ONLY JSON, no markdown" instruction.
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": GENERIC_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        image_block,
+                        {"type": "text", "text": GENERIC_USER_PROMPT},
+                    ],
+                },
+            ],
         )
     except Exception as e:  # noqa: BLE001
-        log.warning("Anthropic vision call failed for %s: %s", label, e)
+        log.warning("OpenAI vision call failed for %s: %s", label, e)
         return {"_label": label, "_extraction_error": f"api_call_failed: {e}"}
 
-    text = "".join(
-        b.text for b in resp.content if getattr(b, "type", None) == "text"
-    )
+    text = resp.choices[0].message.content or ""
     parsed = _parse_json(text)
     if parsed is None:
         return {
             "_label": label,
             "_extraction_error": "json_parse_failed",
-            "_stop_reason": getattr(resp, "stop_reason", None),
+            "_finish_reason": resp.choices[0].finish_reason,
             "_raw_text_preview": text[:4000],
         }
     parsed["_label"] = label
     return parsed
 
 
-def _call_claude_on_page(img) -> dict[str, Any]:
+def _call_llm_on_page(img) -> dict[str, Any]:
     """Parallel per-page extraction — overview + all tiles fire concurrently.
 
-    Each image is a separate Claude call with its own JSON output so a
+    Each image is a separate the LLM call with its own JSON output so a
     failure on one tile is recorded without dropping the rest. Running them
     in a ThreadPoolExecutor turns what was N serial API round-trips into a
     single wall-clock wait equal to the slowest call.
@@ -245,12 +254,12 @@ def _call_claude_on_page(img) -> dict[str, Any]:
             r, c = divmod(idx, cols)
             tasks.append((f"tile_r{r}_c{c}", tile))
 
-    # Fire all calls concurrently — Anthropic SDK is synchronous so we use
+    # Fire all calls concurrently — OpenAI SDK is synchronous so we use
     # threads. Max workers = number of tasks so they all start immediately.
     results: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         future_to_label = {
-            pool.submit(_call_claude_on_image, tile_img, label): label
+            pool.submit(_call_llm_on_image, tile_img, label): label
             for label, tile_img in tasks
         }
         for future in as_completed(future_to_label):
@@ -277,9 +286,9 @@ def _call_claude_on_page(img) -> dict[str, Any]:
 def extract(pdf_path: str | Path) -> dict[str, Any] | None:
     """Format-agnostic PDF extraction. Returns:
 
-        {"pages": [<per-page JSON from Claude>, ...]}
+        {"pages": [<per-page JSON from the LLM>, ...]}
 
-    Each page's JSON is whatever Claude produced from a single generic
+    Each page's JSON is whatever the LLM produced from a single generic
     prompt. The shape is NOT enforced or normalized in any way.
     """
     if not is_enabled():
@@ -295,15 +304,21 @@ def extract(pdf_path: str | Path) -> dict[str, Any] | None:
         return None
 
     # Process pages concurrently — each page's tiles are already parallelised
-    # inside _call_claude_on_page; this outer pool lets multiple pages run at
+    # inside _call_llm_on_page; this outer pool lets multiple pages run at
     # the same time. Cap at 2: each page already fans out to 7 tile calls, so
     # 2 pages × 7 tiles = 14 concurrent API calls — safely within rate limits
     # even when several files are synced in parallel.
     page_results: list[dict[str, Any]] = [{}] * len(pages)
-    max_page_workers = min(len(pages), 2)
+    # With tile grid at 1×1 (recommended for OpenAI), each page is a
+    # single API call — so we can safely run more pages concurrently
+    # without hitting rate limits. OpenAI Tier-1 allows 500 rpm which
+    # means we can burst up to ~8 calls per second sustained; 12
+    # concurrent pages × ~1s each = ~12 in-flight max, comfortably
+    # inside the budget with headroom for retries.
+    max_page_workers = min(len(pages), 12)
     with ThreadPoolExecutor(max_workers=max_page_workers) as pool:
         future_to_idx = {
-            pool.submit(_call_claude_on_page, img): page_idx
+            pool.submit(_call_llm_on_page, img): page_idx
             for page_idx, img in enumerate(pages, start=1)
         }
         for future in as_completed(future_to_idx):

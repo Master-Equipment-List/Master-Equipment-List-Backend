@@ -210,7 +210,7 @@ async def _upsert_project_file(
 
 async def _parse_and_store(db: AsyncSession, pf: ProjectFile) -> FileExtraction:
     # Run parse_file in a thread — it calls vision_pfd_service.extract()
-    # which blocks internally (ThreadPoolExecutor + Claude API calls).
+    # which blocks internally (ThreadPoolExecutor + the LLM API calls).
     # Offloading to a thread keeps the asyncio event loop free so other
     # requests continue to be served while vision is running.
     result = await asyncio.to_thread(parse_file, pf.local_path)
@@ -258,7 +258,7 @@ async def _apply_pfd_updates(
     if not pages:
         return 0
 
-    # map_pfd_fields makes a synchronous Anthropic API call — run in a thread
+    # map_pfd_fields makes a synchronous OpenAI API call — run in a thread
     # so the event loop stays responsive during the ~10-20 s round-trip.
     mapping = await asyncio.to_thread(pfd_field_mapper.map_pfd_fields, pages)
     if not mapping:
@@ -344,7 +344,7 @@ async def _apply_pid_updates(
     if not pages:
         return 0
 
-    # map_pid_fields makes a synchronous Anthropic API call — run in a thread.
+    # map_pid_fields makes a synchronous OpenAI API call — run in a thread.
     mapping = await asyncio.to_thread(pid_field_mapper.map_pid_fields, pages)
     if not mapping:
         return 0
@@ -414,7 +414,7 @@ async def _apply_vendor_updates(
     if not pages:
         return 0
 
-    # map_vendor_fields makes a synchronous Anthropic API call — run in a thread.
+    # map_vendor_fields makes a synchronous OpenAI API call — run in a thread.
     mapping = await asyncio.to_thread(vendor_field_mapper.map_vendor_fields, pages)
     if not mapping:
         return 0
@@ -557,9 +557,9 @@ async def _process_drive_items(
 
     ── Phase 1 (parallel) ──────────────────────────────────────────────────
     Up to 3 files are downloaded and vision-parsed concurrently. The
-    Anthropic SDK is synchronous so each file's parse runs in its own
+    OpenAI SDK is synchronous so each file's parse runs in its own
     thread (asyncio.to_thread inside _parse_and_store). While one file is
-    waiting for Claude to respond the event loop can advance other files'
+    waiting for the LLM to respond the event loop can advance other files'
     downloads, token checks, etc.
 
     ── Phase 2 (sequential) ────────────────────────────────────────────────
@@ -570,7 +570,12 @@ async def _process_drive_items(
     """
 
     # ── Phase 1: parallel skip-check + download + vision ──────────────────
-    sem = asyncio.Semaphore(3)  # max 3 files in-flight simultaneously
+    # Max concurrent files. With tiling reduced from 3×2 to 1×1 each
+    # file makes ~5× fewer API calls, so we can run more in parallel
+    # without hitting OpenAI's rate limit (500 rpm on tier 1, well
+    # within reach). 6 concurrent files × ~4 pages × 1 call each =
+    # ~24 concurrent calls, still comfortable.
+    sem = asyncio.Semaphore(6)
 
     async def _fetch_one(it: dict[str, Any]) -> dict[str, Any]:
         """Download + vision-parse one item. No equipment DB writes."""
@@ -594,7 +599,7 @@ async def _process_drive_items(
 
             local_path = await _ensure_local_file(db, project, it, local_dir)
             # parse_file calls vision_pfd_service.extract() which itself fans
-            # out to many Claude API calls via a ThreadPoolExecutor. Running
+            # out to many the LLM API calls via a ThreadPoolExecutor. Running
             # the whole thing in a thread lets other files proceed in the event
             # loop while this file's vision is in-flight.
             parse_result = await asyncio.to_thread(parse_file, local_path)

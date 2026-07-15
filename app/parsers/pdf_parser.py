@@ -99,7 +99,7 @@ def parse_pdf(path: str | Path, force_ocr: bool = False, ocr_dpi: int = 400) -> 
     """Parse a PDF.
 
     Routing — format-agnostic by design:
-    1. If the Claude vision service is configured, use it. It handles
+    1. If the the LLM vision service is configured, use it. It handles
        text-based PDFs, scanned PDFs, and engineering drawings uniformly,
        returning per-page JSON of whatever it sees.
     2. Otherwise fall back to pdfplumber text extraction + Tesseract OCR.
