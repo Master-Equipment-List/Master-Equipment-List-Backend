@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.extractors import pfd_extractor, vendor_extractor
-from app.extractors.tags import normalize_tag
+from app.extractors.tags import find_fuzzy_tag_match, normalize_tag
 from app.models import (
     Equipment,
     FileExtraction,
@@ -30,6 +31,9 @@ from app.models import (
 from app.parsers import parse_file
 from app.services import audit_service, onedrive_service
 from app.services.version_service import apply_update
+
+
+log = logging.getLogger(__name__)
 
 
 PFD_CATEGORY = "PFD Samples"
@@ -507,7 +511,22 @@ async def _load_equipment_map(
 
 
 def _find_equipment_in_map(eq_map: dict[str, Equipment], tag: str) -> Equipment | None:
-    return eq_map.get(normalize_tag(tag))
+    eq = eq_map.get(normalize_tag(tag))
+    if eq:
+        return eq
+    # Exact match failed — vision extraction sometimes misreads a single
+    # character (e.g. "S" as "5") on small drawing text. Before treating
+    # this as a brand-new tag (and creating a duplicate equipment row),
+    # check whether it's a one-character-confusable match against a tag
+    # that already exists in this project.
+    fuzzy_key = find_fuzzy_tag_match(tag, eq_map.keys())
+    if fuzzy_key:
+        log.info(
+            "Tag %r matched existing equipment %r via confusable-character "
+            "correction (likely vision misread)", tag, fuzzy_key,
+        )
+        return eq_map.get(fuzzy_key)
+    return None
 
 
 async def _find_equipment_by_tag(

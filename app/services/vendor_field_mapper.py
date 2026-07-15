@@ -299,6 +299,12 @@ From this JSON, find:
    "H-S67110"). Usually visible in the document title, title block, or a
    heading. Tags use LETTER-LETTER+DIGITS with optional /letter suffixes.
 
+   The character immediately after the hyphen is ALWAYS a letter, never a
+   digit — look closely, since a stylized "S" is easy to misread as "5"
+   (and "O" as "0", "I" as "1", "B" as "8") in small drawing text. If your
+   first read of that position is a digit, re-examine the glyph before
+   settling on it.
+
 2. These values, if explicitly stated anywhere in the JSON:
 
    Core numerics (units must be converted as noted):

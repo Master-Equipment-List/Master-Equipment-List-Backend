@@ -102,6 +102,12 @@ A P&ID covers one or a small number of equipment items in detail. Identify:
    line callouts). Tags look like LETTER-LETTER+DIGITS with optional /letter
    suffixes (V-S67105, P-S67115A/B, H-S37110, etc.).
 
+   The character immediately after the hyphen is ALWAYS a letter, never a
+   digit — look closely, since a stylized "S" is easy to misread as "5"
+   (and "O" as "0", "I" as "1", "B" as "8") in small drawing text. If your
+   first read of that position is a digit, re-examine the glyph before
+   settling on it.
+
 2. For each equipment tag, extract these MEL equipment-row fields when
    explicitly stated anywhere in the JSON. Set to null otherwise:
 
