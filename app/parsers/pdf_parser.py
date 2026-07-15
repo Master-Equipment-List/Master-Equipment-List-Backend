@@ -135,23 +135,21 @@ def parse_pdf(path: str | Path, force_ocr: bool = False, ocr_dpi: int = 400) -> 
                 "text": _flatten_strings(v["pages"]),
             }
             return res
-        # Vision returned nothing. This is almost always a poppler /
-        # pdf2image issue on the deploy target: the exception is caught
-        # inside `vision_pfd_service.extract()` (which returns None) and
-        # never bubbles up as an error. Without a visible signal here,
-        # the file just quietly falls back to pdfplumber — which doesn't
-        # produce `vision_pages`, so every field mapper (PFD / P&ID /
-        # Vendor) silently skips the file and the sync summary shows
-        # "0 updates applied" with no explanation. Surface the failure
-        # so ops can see it in the extraction record.
+        # Vision returned nothing. The exception is caught inside
+        # `vision_pfd_service.extract()` (which returns None) and never
+        # bubbles up as an error. Without a visible signal here, the file
+        # just quietly falls back to pdfplumber — which doesn't produce
+        # `vision_pages`, so every field mapper (PFD / P&ID / Vendor)
+        # silently skips the file and the sync summary shows "0 updates
+        # applied" with no explanation. Surface the failure so ops can see
+        # it in the extraction record.
         if res.error is None:
             res.error = (
-                "vision pipeline returned no pages — most likely "
-                "poppler-utils / pdf2image is missing on the server. "
-                "Falling back to pdfplumber text extraction, which will "
-                "NOT populate the field mappers. Install poppler-utils "
-                "on the deployment host (Render: run build.sh in the "
-                "build command)."
+                "vision pipeline returned no pages — check ANTHROPIC_API_KEY "
+                "is set and the file is a readable PDF (rendering uses "
+                "pypdfium2, which has no system dependency). Falling back "
+                "to pdfplumber text extraction, which will NOT populate the "
+                "field mappers."
             )
 
     # ---- Path B: pdfplumber + OCR fallback --------------------------------

@@ -88,17 +88,30 @@ def is_enabled() -> bool:
 
 
 def _render_pages(pdf_path: str | Path, max_pages: int, dpi: int) -> list:
-    """Render up to ``max_pages`` of a PDF to PIL Images."""
+    """Render up to ``max_pages`` of a PDF to PIL Images.
+
+    Uses pypdfium2 rather than pdf2image/poppler: pypdfium2 ships a
+    prebuilt PDFium binary inside its own pip wheel, so rendering works
+    identically in dev and on any deploy target with no system package
+    (no apt-get poppler-utils, no build.sh step, no PATH configuration).
+    """
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(str(pdf_path))
     try:
-        from pdf2image import convert_from_path
-    except ImportError as e:
-        raise RuntimeError(f"pdf2image not installed: {e}")
-    kwargs: dict[str, Any] = {}
-    if settings.POPPLER_PATH:
-        kwargs["poppler_path"] = settings.POPPLER_PATH
-    if max_pages and max_pages > 0:
-        kwargs["last_page"] = max_pages
-    return convert_from_path(str(pdf_path), dpi=dpi, **kwargs)
+        n_pages = len(doc)
+        last = n_pages if not max_pages or max_pages <= 0 else min(max_pages, n_pages)
+        scale = dpi / 72.0
+        images = []
+        for i in range(last):
+            page = doc[i]
+            try:
+                images.append(page.render(scale=scale).to_pil())
+            finally:
+                page.close()
+        return images
+    finally:
+        doc.close()
 
 
 # Anthropic's vision API rejects images with any dimension > 8000 px.

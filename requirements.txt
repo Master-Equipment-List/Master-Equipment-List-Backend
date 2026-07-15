@@ -17,6 +17,9 @@ msal==1.31.1
 pdfplumber==0.11.4
 pypdf==5.1.0
 pdf2image==1.17.0
+# Pinned explicitly (was previously a transitive dep): renders PDF pages
+# for the vision pipeline without needing the poppler-utils system package.
+pypdfium2==5.8.0
 pytesseract==0.3.13
 Pillow==11.0.0
 openpyxl==3.1.5

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # Render build script.
 #
-# Installs the system packages the vision pipeline needs BEFORE the pip
-# install runs. Without these two the sync silently degrades to
-# text-only extraction:
+# The primary vision pipeline (vision_pfd_service.py) renders PDF pages
+# via pypdfium2, which bundles its own PDF engine in the pip wheel — no
+# system package needed for it. What's left below is only for the
+# secondary pdfplumber + Tesseract OCR fallback path (used when
+# ANTHROPIC_API_KEY isn't set, or the vision call itself fails):
 #
-#   * poppler-utils — pdf2image renders PDF pages to images. Vision
-#     pipeline REQUIRES this. Without it,
-#     `vision_pfd_service.extract()` catches the ImportError and returns
-#     None, and parse_pdf silently falls back to pdfplumber (which reads
-#     text but doesn't produce `vision_pages`). Without `vision_pages`,
-#     every field mapper (PFD / P&ID / Vendor) skips the file and the
-#     sync summary shows 0 updates applied.
+#   * poppler-utils — pdf2image renders PDF pages to images for the OCR
+#     fallback in parse_pdf._ocr_pages.
 #
-#   * tesseract-ocr — the OCR fallback in parse_pdf calls
-#     pytesseract.image_to_string. If a PDF is scanned (no embedded
-#     text), pdfplumber returns empty strings and the code re-tries
-#     via OCR — which needs both tesseract AND poppler (for rendering).
+#   * tesseract-ocr — the OCR fallback calls pytesseract.image_to_string.
+#     If a PDF is scanned (no embedded text), pdfplumber returns empty
+#     strings and the code re-tries via OCR — which needs both tesseract
+#     AND poppler (for rendering).
+#
+# Without these two, that fallback path silently degrades to text-only
+# extraction for scanned PDFs — it no longer affects the main vision path.
 #
 # Configure Render's "Build Command" to:
 #   ./build.sh
