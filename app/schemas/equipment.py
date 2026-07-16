@@ -106,6 +106,29 @@ class EquipmentOut(EquipmentBase):
     updated_at: datetime
 
 
+class DuplicatePairOut(BaseModel):
+    """One candidate pair from the on-demand duplicate audit — a judgment
+    call for a human, not a confirmed duplicate. Many real pairs (e.g.
+    identical spare/redundant units across different trains) are
+    intentionally identical and NOT actual data-entry duplicates."""
+    equipment_a: EquipmentOut
+    equipment_b: EquipmentOut
+    description_similarity: float
+    type_similarity: float
+
+
+class MergeEquipmentRequest(BaseModel):
+    # TRACKED_FIELDS names to pull from the row being removed onto the row
+    # being kept. Fields not listed keep the kept row's existing value.
+    accepted_fields: list[str] = []
+
+
+class MergeEquipmentResponse(BaseModel):
+    kept_equipment_id: int
+    removed_equipment_id: int
+    applied_fields: list[str] = []
+
+
 class EquipmentVersionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

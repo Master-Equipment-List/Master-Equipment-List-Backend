@@ -21,10 +21,18 @@ from app.deps import CurrentUser, DbSession, project_access
 from app.extractors.topside_excel import extract_equipment_rows
 from app.models import Equipment, EquipmentVersion, Project
 from app.schemas.common import Page
-from app.schemas.equipment import EquipmentCreate, EquipmentOut, EquipmentUpdate
+from app.schemas.equipment import (
+    DuplicatePairOut,
+    EquipmentCreate,
+    EquipmentOut,
+    EquipmentUpdate,
+    MergeEquipmentRequest,
+    MergeEquipmentResponse,
+)
 from app.services import audit_service
+from app.services.duplicate_detection import find_all_duplicate_pairs
 from app.services.quantity import compute_installed_weight, pick_effective_total
-from app.services.version_service import apply_update, record_initial_version
+from app.services.version_service import TRACKED_FIELDS, apply_update, record_initial_version
 
 router = APIRouter()
 
@@ -105,6 +113,120 @@ async def list_equipment(
     stmt = stmt.order_by(order).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     return Page(items=rows, total=total, limit=limit, offset=offset)
+
+
+# Registered here (before the parameterized /equipment/{equipment_id} GET
+# below) so "duplicate-audit" is matched as this literal path rather than
+# being swallowed as an equipment_id and failing int coercion — same class
+# of bug fixed for /equipment/pending earlier.
+@router.get(
+    "/projects/{project_id}/equipment/duplicate-audit",
+    response_model=Page[DuplicatePairOut],
+)
+async def duplicate_audit(
+    db: DbSession,
+    project: Project = Depends(project_access("viewer")),
+    workspace: str | None = Query(None, description="Filter to one workspace; omit for all."),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """On-demand scan across every EXISTING equipment row (independent of
+    syncing) for description+type fuzzy matches — candidate pairs for an
+    admin to judge, not confirmed duplicates. Many real pairs are
+    intentionally-identical spare/redundant units across different
+    trains/modules, not data-entry mistakes; that's expected, this is a
+    review tool, nothing here is applied automatically.
+    """
+    stmt = select(Equipment).where(Equipment.project_id == project.id)
+    if workspace:
+        stmt = stmt.where(Equipment.workspace == workspace)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    pairs = find_all_duplicate_pairs(rows)
+    total = len(pairs)
+    page_pairs = pairs[offset:offset + limit]
+    return Page(
+        items=[
+            DuplicatePairOut(
+                equipment_a=p.a, equipment_b=p.b,
+                description_similarity=p.description_similarity,
+                type_similarity=p.type_similarity,
+            )
+            for p in page_pairs
+        ],
+        total=total, limit=limit, offset=offset,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/equipment/{keep_id}/merge/{remove_id}",
+    response_model=MergeEquipmentResponse,
+)
+async def merge_equipment(
+    keep_id: int,
+    remove_id: int,
+    payload: MergeEquipmentRequest,
+    db: DbSession,
+    user: CurrentUser,
+    project: Project = Depends(project_access("admin")),
+):
+    """Admin confirmed two rows ARE the same physical equipment: apply the
+    admin-selected subset of ``remove``'s field values onto ``keep`` (via
+    the normal ``apply_update`` path, so a version snapshot is recorded),
+    then permanently delete ``remove`` — its own tag and version history
+    are gone; only ``keep``'s history is kept, extended with this merge.
+    Restricted to project admins — this is destructive and can't be undone
+    (same as the existing single/bulk equipment delete).
+    """
+    if keep_id == remove_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a row into itself")
+
+    keep = (
+        await db.execute(
+            select(Equipment).where(Equipment.id == keep_id, Equipment.project_id == project.id)
+        )
+    ).scalar_one_or_none()
+    remove = (
+        await db.execute(
+            select(Equipment).where(Equipment.id == remove_id, Equipment.project_id == project.id)
+        )
+    ).scalar_one_or_none()
+    if not keep or not remove:
+        raise HTTPException(status_code=404, detail="Equipment not found")
+
+    changes = {
+        field: getattr(remove, field)
+        for field in payload.accepted_fields
+        if field in TRACKED_FIELDS
+    }
+    applied_fields: list[str] = []
+    if changes:
+        version = await apply_update(
+            db, keep, changes,
+            source="manual",
+            source_file_id=None,
+            user_id=user.id,
+            note=f"Merged {remove.client_tag} into this row",
+        )
+        if version:
+            applied_fields = [f for f in version.changed_fields if f in changes]
+
+    await audit_service.log(
+        db, action="equipment.merge",
+        user_id=user.id, project_id=project.id,
+        entity_type="equipment", entity_id=keep.id,
+        metadata={
+            "removed_equipment_id": remove.id,
+            "removed_client_tag": remove.client_tag,
+            "accepted_fields": payload.accepted_fields,
+            "applied_fields": applied_fields,
+        },
+    )
+    await db.delete(remove)
+    await db.commit()
+    return MergeEquipmentResponse(
+        kept_equipment_id=keep.id, removed_equipment_id=remove_id, applied_fields=applied_fields,
+    )
 
 
 @router.post("/projects/{project_id}/equipment", response_model=EquipmentOut, status_code=201)

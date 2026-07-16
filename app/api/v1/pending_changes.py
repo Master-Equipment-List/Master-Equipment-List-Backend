@@ -6,6 +6,7 @@ from app.models import Equipment, EquipmentPendingChange, Project, ProjectFile, 
 from app.schemas.common import Page
 from app.schemas.pending_change import (
     ApprovePendingChangeRequest,
+    ConfirmNewResponse,
     PendingChangeOut,
     ResolvePendingChangeResponse,
 )
@@ -13,6 +14,8 @@ from app.services import audit_service
 from app.services.pending_change_service import (
     approve_pending_change,
     reject_pending_change,
+    resolve_duplicate_as_merge,
+    resolve_duplicate_as_new,
 )
 
 router = APIRouter()
@@ -95,6 +98,8 @@ async def list_pending_changes(
                 source=p.source,
                 source_file_id=p.source_file_id,
                 source_file_name=file_name_by_id.get(p.source_file_id) if p.source_file_id else None,
+                kind=p.kind,
+                new_tag=p.new_tag,
                 proposed_fields=p.proposed_fields,
                 status=p.status,
                 created_by_name=user_name_by_id.get(p.created_by_id) if p.created_by_id else None,
@@ -130,8 +135,15 @@ async def approve_pending_change_route(
     project: Project = Depends(project_access("admin")),
 ):
     """Apply the admin-selected subset of a pending change's fields, then
-    mark it resolved (kept as history). Restricted to project admins."""
+    mark it resolved (kept as history). Restricted to project admins.
+    Only for kind="update" — see confirm-new/confirm-duplicate below for
+    kind="possible_duplicate"."""
     pc = await _get_pending_or_404(db, project.id, pending_id)
+    if pc.kind != "update":
+        raise HTTPException(
+            status_code=400,
+            detail="This is a possible-duplicate item — use confirm-new or confirm-duplicate instead.",
+        )
     eq = await db.get(Equipment, pc.equipment_id)
     if not eq:
         await reject_pending_change(db, pc, user_id=user.id)
@@ -151,6 +163,92 @@ async def approve_pending_change_route(
         metadata={
             "equipment_id": eq.id,
             "client_tag": eq.client_tag,
+            "accepted_fields": payload.accepted_fields,
+            "applied_fields": result["applied_fields"],
+        },
+    )
+    await db.commit()
+    return ResolvePendingChangeResponse(applied_fields=result["applied_fields"])
+
+
+def _require_duplicate_kind(pc: EquipmentPendingChange) -> None:
+    if pc.kind != "possible_duplicate":
+        raise HTTPException(
+            status_code=400,
+            detail="This is a normal update item — use approve/reject instead.",
+        )
+
+
+@router.post(
+    "/projects/{project_id}/equipment/pending/{pending_id}/confirm-new",
+    response_model=ConfirmNewResponse,
+)
+async def confirm_new_route(
+    pending_id: int,
+    db: DbSession,
+    user: CurrentUser,
+    project: Project = Depends(project_access("admin")),
+):
+    """Admin confirmed: this is genuinely new equipment, not a duplicate of
+    the flagged candidate. Creates it under the incoming tag. Restricted
+    to project admins."""
+    pc = await _get_pending_or_404(db, project.id, pending_id)
+    _require_duplicate_kind(pc)
+
+    eq = await resolve_duplicate_as_new(db, pc, project.id, user_id=user.id)
+    await audit_service.log(
+        db,
+        action="equipment.pending_duplicate_confirmed_new",
+        user_id=user.id,
+        project_id=project.id,
+        metadata={
+            "new_equipment_id": eq.id,
+            "client_tag": eq.client_tag,
+            "candidate_equipment_id": pc.equipment_id,
+        },
+    )
+    await db.commit()
+    return ConfirmNewResponse(equipment_id=eq.id, client_tag=eq.client_tag)
+
+
+@router.post(
+    "/projects/{project_id}/equipment/pending/{pending_id}/confirm-duplicate",
+    response_model=ResolvePendingChangeResponse,
+)
+async def confirm_duplicate_route(
+    pending_id: int,
+    payload: ApprovePendingChangeRequest,
+    db: DbSession,
+    user: CurrentUser,
+    project: Project = Depends(project_access("admin")),
+):
+    """Admin confirmed: this IS the same equipment as the flagged candidate,
+    just under a different/corrected tag. Applies the admin-selected subset
+    of fields onto the candidate (its own tag is never renamed). Restricted
+    to project admins."""
+    pc = await _get_pending_or_404(db, project.id, pending_id)
+    _require_duplicate_kind(pc)
+
+    candidate = await db.get(Equipment, pc.equipment_id)
+    if not candidate:
+        await reject_pending_change(db, pc, user_id=user.id)
+        await db.commit()
+        raise HTTPException(status_code=404, detail="Candidate equipment row no longer exists")
+
+    result = await resolve_duplicate_as_merge(
+        db, pc, candidate,
+        accepted_fields=payload.accepted_fields,
+        user_id=user.id,
+    )
+    await audit_service.log(
+        db,
+        action="equipment.pending_duplicate_confirmed_duplicate",
+        user_id=user.id,
+        project_id=project.id,
+        metadata={
+            "candidate_equipment_id": candidate.id,
+            "candidate_client_tag": candidate.client_tag,
+            "incoming_tag": pc.new_tag,
             "accepted_fields": payload.accepted_fields,
             "applied_fields": result["applied_fields"],
         },

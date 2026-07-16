@@ -1,29 +1,47 @@
 """Per-equipment pending sync change awaiting admin approval.
 
-When a sync (PFD / P&ID / Vendor Data / Equipment List Excel) finds a tag
-that matches an EXISTING equipment row, the proposed field changes are NOT
-applied immediately. Instead a row here holds the field-level diff (old vs
-new, only for fields that actually differ) for a project admin to review.
+Two distinct KINDS of proposal live in this one table:
 
-New equipment rows (a tag the sync doesn't find yet) are unaffected — since
-there's no existing data to overwrite, those still auto-create as before.
+* ``kind="update"`` (the original / default) — a sync found a tag that
+  matches an EXISTING equipment row. The proposed field changes are NOT
+  applied immediately; this row holds the field-level diff (old vs new,
+  only for fields that actually differ) for a project admin to review.
+  ``equipment_id`` is the row being updated.
 
-At most one row with ``status="pending"`` per ``equipment_id``: if the
-same equipment gets synced again while an earlier proposal is still
-awaiting review, the newer proposal REPLACES it in place (see
-``queue_pending_change`` in ``app.services.pending_change_service``)
-rather than stacking entries. Once a row is resolved (approved/rejected)
-it's kept as history — a later sync proposing a new change creates a
-FRESH row rather than touching the resolved one.
+* ``kind="possible_duplicate"`` — a sync found a tag that does NOT match
+  any existing row, but its description + equipment type fuzzy-match an
+  EXISTING row under a DIFFERENT tag (see
+  ``app.services.duplicate_detection``). Rather than blindly auto-creating
+  a second row for what might be the same physical equipment (e.g. a
+  vision misread tag, or a genuine tag change), this queues a review: the
+  admin sees the candidate side-by-side and decides whether it's really
+  new equipment or the same thing under a corrected tag. Here
+  ``equipment_id`` is the CANDIDATE existing row (not one being blindly
+  updated), ``new_tag`` is the incoming tag that would become a new row's
+  ``client_tag`` if confirmed as new, and ``proposed_fields`` diffs the
+  candidate's current values against the incoming sync's values.
 
-Approval is per-field: the admin picks, for each proposed field, whether
-to keep the existing value or accept the new one. Only the accepted
-fields get written (via the normal ``apply_update`` path, so the usual
-precedence rules and ``EquipmentVersion`` snapshot still apply).
-``created_by_id`` records who triggered the sync that queued the
-proposal; ``resolved_by_id``/``resolved_at`` record who approved or
-rejected it and when — kept indefinitely for audit visibility on the
-Pending Changes page.
+At most one PENDING row per identity: for ``update`` that's
+``equipment_id``; for ``possible_duplicate`` that's ``new_tag`` (so it
+doesn't collide with a normal update-kind proposal already pending on the
+same candidate row). A newer sync proposing the same thing REPLACES the
+still-pending row in place (see ``pending_change_service.py``) rather than
+stacking entries. Once resolved, the row is kept as history — a later sync
+creates a FRESH row rather than touching the resolved one.
+
+Resolution is per-field for ``update`` (the admin picks, for each proposed
+field, whether to keep the existing value or accept the new one — only
+accepted fields get written, via the normal ``apply_update`` path, so
+precedence rules and ``EquipmentVersion`` snapshots still apply). For
+``possible_duplicate`` the admin instead picks ONE of two whole-item
+actions: confirm as new equipment (creates it under ``new_tag``) or
+confirm as duplicate (merges the incoming fields onto the candidate
+``equipment_id`` instead).
+
+``created_by_id`` records who triggered the sync that queued/last-replaced
+the proposal; ``resolved_by_id``/``resolved_at`` record who resolved it,
+how, and when — kept indefinitely for audit visibility on the Pending
+Changes page.
 """
 from __future__ import annotations
 
@@ -58,13 +76,21 @@ class EquipmentPendingChange(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
+    # "update" | "possible_duplicate" — see module docstring.
+    kind: Mapped[str] = mapped_column(String(24), nullable=False, default="update")
+    # Only set for kind="possible_duplicate": the incoming tag that would
+    # become the new equipment row's client_tag if confirmed as new.
+    new_tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     # {"field_name": {"old": <value>, "new": <value>}, ...} — only fields
     # whose incoming value differs from the equipment row's current value
     # at the time this proposal was queued/replaced.
     proposed_fields: Mapped[dict] = mapped_column(JSON, nullable=False)
 
-    # "pending" | "approved" | "rejected"
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    # "pending" | "approved" | "rejected" (kind="update") or
+    # "pending" | "confirmed_new" | "confirmed_duplicate" | "rejected"
+    # (kind="possible_duplicate").
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
     resolved_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

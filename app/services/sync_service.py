@@ -30,7 +30,8 @@ from app.models import (
 )
 from app.parsers import parse_file
 from app.services import audit_service, onedrive_service
-from app.services.pending_change_service import queue_pending_change
+from app.services.duplicate_detection import find_duplicate_candidate
+from app.services.pending_change_service import queue_pending_change, queue_possible_duplicate
 
 
 log = logging.getLogger(__name__)
@@ -314,16 +315,12 @@ async def _apply_pfd_updates(
                 if summary is not None:
                     summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         else:
-            await create_equipment_from_sync(
-                db, project.id, tag.strip(), fields,
-                source="pfd",
-                source_file_id=file.id,
-                user_id=user_id,
-                workspace=file.workspace,
+            created = await _create_or_flag_duplicate(
+                db, project, file, eq_map, tag, fields,
+                source="pfd", user_id=user_id, workspace=file.workspace, summary=summary,
             )
-            affected += 1
-            if summary is not None:
-                summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+            if created:
+                affected += 1
     return affected
 
 
@@ -393,16 +390,12 @@ async def _apply_pid_updates(
                 if summary is not None:
                     summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         else:
-            await create_equipment_from_sync(
-                db, project.id, tag.strip(), fields,
-                source="pid",
-                source_file_id=file.id,
-                user_id=user_id,
-                workspace=file.workspace,
+            created = await _create_or_flag_duplicate(
+                db, project, file, eq_map, tag, fields,
+                source="pid", user_id=user_id, workspace=file.workspace, summary=summary,
             )
-            affected += 1
-            if summary is not None:
-                summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+            if created:
+                affected += 1
     return affected
 
 
@@ -489,16 +482,11 @@ async def _apply_vendor_updates(
             summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         return 1 if pc else 0
     else:
-        await create_equipment_from_sync(
-            db, project.id, tag.strip(), fields,
-            source="vendor",
-            source_file_id=file.id,
-            user_id=user_id,
-            workspace=file.workspace,
+        created = await _create_or_flag_duplicate(
+            db, project, file, eq_map, tag, fields,
+            source="vendor", user_id=user_id, workspace=file.workspace, summary=summary,
         )
-        if summary is not None:
-            summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
-        return 1
+        return 1 if created else 0
 
 
 async def _apply_equipment_list_updates(
@@ -569,17 +557,13 @@ async def _apply_equipment_list_updates(
                 if summary is not None:
                     summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         else:
-            new_eq = await create_equipment_from_sync(
-                db, project.id, tag, fields,
-                source="excel",
-                source_file_id=file.id,
-                user_id=user_id,
-                workspace=workspace,
+            new_eq = await _create_or_flag_duplicate(
+                db, project, file, eq_map, tag, fields,
+                source="excel", user_id=user_id, workspace=workspace, summary=summary,
             )
-            eq_map[normalize_tag(tag)] = new_eq
-            affected += 1
-            if summary is not None:
-                summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+            if new_eq:
+                eq_map[normalize_tag(tag)] = new_eq
+                affected += 1
     return affected
 
 
@@ -621,6 +605,58 @@ def _find_equipment_in_map(eq_map: dict[str, Equipment], tag: str) -> Equipment 
         )
         return eq_map.get(fuzzy_key)
     return None
+
+
+async def _create_or_flag_duplicate(
+    db: AsyncSession,
+    project: Project,
+    file: ProjectFile,
+    eq_map: dict[str, Equipment],
+    tag: str,
+    fields: dict[str, Any],
+    *,
+    source: str,
+    user_id: int | None,
+    workspace: str,
+    summary: dict[str, Any] | None,
+) -> Equipment | None:
+    """A tag not found by exact/fuzzy TAG match — before blindly creating a
+    new equipment row, check whether an EXISTING row's description +
+    equipment type fuzzy-match this incoming data closely enough to be the
+    same physical equipment under a different/corrected tag (a vision
+    misread, a renumbering). If so, queue it for admin review instead of
+    silently creating a probable duplicate; the admin decides whether it's
+    genuinely new or the same thing under the existing tag.
+
+    Returns the newly-created Equipment, or ``None`` if a duplicate was
+    flagged instead (nothing created in that case).
+    """
+    from app.services.equipment_create_helper import create_equipment_from_sync
+
+    candidate = find_duplicate_candidate(
+        eq_map.values(),
+        description=fields.get("description"),
+        equipment_type=fields.get("equipment_type"),
+        incoming_tag=tag,
+    )
+    if candidate:
+        pc = await queue_possible_duplicate(
+            db, candidate, tag.strip(), fields,
+            source=source, source_file_id=file.id, user_id=user_id,
+        )
+        if pc and summary is not None:
+            summary["possible_duplicates_flagged"] = (
+                summary.get("possible_duplicates_flagged") or 0
+            ) + 1
+        return None
+
+    new_eq = await create_equipment_from_sync(
+        db, project.id, tag.strip(), fields,
+        source=source, source_file_id=file.id, user_id=user_id, workspace=workspace,
+    )
+    if summary is not None:
+        summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+    return new_eq
 
 
 async def _find_equipment_by_tag(
@@ -817,6 +853,11 @@ async def run_sync(
         # (see EquipmentPendingChange). New equipment (tags not seen
         # before) still auto-creates and is NOT part of this count.
         "pending_changes_queued": 0,
+        # A tag that didn't match anything, but whose description +
+        # equipment type fuzzy-matched an EXISTING row under a different
+        # tag — queued for admin review (confirm as new vs merge into the
+        # match) instead of silently auto-creating a probable duplicate.
+        "possible_duplicates_flagged": 0,
         "equipment_created": 0,
         # Updates that were silently skipped because a higher-priority
         # source (P&ID) had already set the row. Helps users understand
@@ -881,6 +922,11 @@ async def sync_single_item(
         # (see EquipmentPendingChange). New equipment (tags not seen
         # before) still auto-creates and is NOT part of this count.
         "pending_changes_queued": 0,
+        # A tag that didn't match anything, but whose description +
+        # equipment type fuzzy-matched an EXISTING row under a different
+        # tag — queued for admin review (confirm as new vs merge into the
+        # match) instead of silently auto-creating a probable duplicate.
+        "possible_duplicates_flagged": 0,
         "equipment_created": 0,
         # Updates that were silently skipped because a higher-priority
         # source (P&ID) had already set the row. Helps users understand
