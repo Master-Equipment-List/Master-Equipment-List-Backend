@@ -28,7 +28,7 @@ FIELD_HEADER_PATTERNS: dict[str, list[str]] = {
         # Topsides
         "client equipment", "tag no.", "tag no", "client tag",
         # Marine
-        "tag number", "tag_number",
+        "tag number", "tag_number", "equipment tag",
     ],
     "description": [
         "description",            # matches "DESCRIPTION" + "EQUIPMENT DESCRIPTION"
@@ -56,17 +56,24 @@ FIELD_HEADER_PATTERNS: dict[str, list[str]] = {
     "design_press": ["design pressure", "design press"],
     "design_temp": ["design temperature", "design temp"],
     "design_flow": ["design flow"],
-    "pump_capacity": ["pump / compressor", "pump/compressor", "pump capacity", "tank capac"],
+    "pump_capacity": [
+        "pump / compressor", "pump/compressor", "pump capacity", "tank capac",
+        "capacity",  # bare fallback — last, so more specific matches above win
+    ],
     "heat_exchanger_duty_kw": ["heat exchanger duty"],
     "liquid_fill": ["liquid fill"],
     "absorbed_power_kw": [
         "absorbed power", "absorbed\npower",
         "electrical absorbed power",  # Marine
+        "power per unit",  # Marine: single unqualified power column
     ],
     "rated_power_kw": ["rated power", "rated\npower"],
-    "length_m": ["l or", "l or\nt/t"],
-    "width_id_m": ["w or", "w or\ni.d"],
-    "height_tt_m": ["h or", "h or\nt/t"],
+    # "l (m)" / "w (m)" / "h (m)" are the Marine spelling for separate
+    # L/W/H columns (Topsides uses "L OR\nT/T" etc). Order matters here:
+    # these must NOT be added to the combined-dimension patterns below.
+    "length_m": ["l or", "l or\nt/t", "l (m)"],
+    "width_id_m": ["w or", "w or\ni.d", "w (m)"],
+    "height_tt_m": ["h or", "h or\nt/t", "h (m)"],
     # Marine has a SINGLE combined column "DIMENSION (mm) L x W x H".
     # We capture it under a virtual field then split during row parsing.
     "_dimension_lxwxh_mm": [
@@ -84,6 +91,12 @@ FIELD_HEADER_PATTERNS: dict[str, list[str]] = {
         "operating weight per unit", "ope wt", "op weight",
         "weight (mt) (oper)", "weight(mt) (oper)", "weight (oper)",
         "operating weight", "operational weight",
+        # Bare fallback for a single unqualified "WEIGHT (MT)" column (no
+        # dry/oper split). Safe as a LAST resort only because dry_weight_mt
+        # is checked earlier in this dict and has its own "(dry)"-qualified
+        # patterns — those always win first on a document that qualifies
+        # both columns, so this only fires when there's just one column.
+        "weight (mt)",
     ],
     "hydrotest_weight_mt": ["hydrotest weight"],
     "pid": ["p&id", "pfd number", "p & id"],

@@ -23,6 +23,9 @@ class BrowseResponse(BaseModel):
     project_id: int
     root_path: str | None
     items: list[DriveItem]
+    total: int
+    limit: int
+    offset: int
 
 
 class SelectionItem(BaseModel):

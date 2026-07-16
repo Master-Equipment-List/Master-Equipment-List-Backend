@@ -1,19 +1,28 @@
-from fastapi import APIRouter, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import func, select
 
 from app.core.security import hash_password
 from app.deps import AdminUser, DbSession
 from app.models import User
+from app.schemas.common import Page
 from app.schemas.user import UserOut, UserUpdate
 from app.services import audit_service
 
 router = APIRouter()
 
 
-@router.get("", response_model=list[UserOut])
-async def list_users(db: DbSession, _admin: AdminUser):
-    rows = (await db.execute(select(User).order_by(User.id))).scalars().all()
-    return rows
+@router.get("", response_model=Page[UserOut])
+async def list_users(
+    db: DbSession,
+    _admin: AdminUser,
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    total = (await db.execute(select(func.count()).select_from(User))).scalar_one()
+    rows = (
+        await db.execute(select(User).order_by(User.id).limit(limit).offset(offset))
+    ).scalars().all()
+    return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{user_id}", response_model=UserOut)

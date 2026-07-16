@@ -11,7 +11,12 @@ router = APIRouter()
 async def trigger_sync(
     db: DbSession,
     user: CurrentUser,
-    project: Project = Depends(project_access("editor")),
+    # Triggering a sync only reads from OneDrive and queues/creates
+    # equipment changes for review — it doesn't touch the project's
+    # OneDrive selection or approve anything, so "viewer" is enough.
+    # Approving/rejecting the resulting pending changes still requires
+    # project admin (see app/api/v1/pending_changes.py).
+    project: Project = Depends(project_access("viewer")),
     workspace: str = Query(
         "topside",
         description="Which workspace to sync: 'topside' or 'marine'. Each workspace has its own OneDrive root + selections.",
@@ -34,7 +39,12 @@ async def trigger_sync(
 async def trigger_single_item_sync(
     db: DbSession,
     user: CurrentUser,
-    project: Project = Depends(project_access("editor")),
+    # Triggering a sync only reads from OneDrive and queues/creates
+    # equipment changes for review — it doesn't touch the project's
+    # OneDrive selection or approve anything, so "viewer" is enough.
+    # Approving/rejecting the resulting pending changes still requires
+    # project admin (see app/api/v1/pending_changes.py).
+    project: Project = Depends(project_access("viewer")),
     item_id: str = Query(..., description="OneDrive drive-item id to sync."),
     workspace: str = Query(
         "topside",

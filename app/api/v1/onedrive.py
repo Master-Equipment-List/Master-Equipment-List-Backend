@@ -24,19 +24,7 @@ router = APIRouter()
 
 @router.get("/onedrive/status")
 async def onedrive_status(db: DbSession, _admin: AdminUser):
-    tok = (
-        await db.execute(select(OneDriveToken).where(OneDriveToken.tenant_id == settings.MS_TENANT_ID))
-    ).scalar_one_or_none()
-    if not tok:
-        return {"connected": False}
-    return {
-        "connected": True,
-        "account_email": tok.account_email,
-        "tenant_id": tok.tenant_id,
-        "expires_at": tok.expires_at,
-        "scope": tok.scope,
-        "has_refresh_token": bool(tok.refresh_token),
-    }
+    return await onedrive_service.verify_connection(db)
 
 
 @router.delete("/onedrive/disconnect", status_code=204)
@@ -138,7 +126,8 @@ async def onedrive_oauth_callback(
         qs = urllib.parse.urlencode({"status": "error", "message": str(e)})
         return RedirectResponse(url=f"{target}?{qs}", status_code=302)
 
-    await onedrive_service.save_token(db, token_data)
+    account_email = await onedrive_service._fetch_account_email(token_data["access_token"])
+    await onedrive_service.save_token(db, token_data, account_email)
     await db.commit()
     return RedirectResponse(url=f"{target}?status=connected", status_code=302)
 
@@ -152,16 +141,28 @@ async def browse(
     project: Project = Depends(project_access("viewer")),
     item_id: str | None = Query(None, description="Folder item id to drill into; omit for project root."),
     workspace: str = Query("topside", description="Which workspace's OneDrive root to browse: 'topside' or 'marine'."),
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
 ):
     try:
         items = await onedrive_service.list_children(db, project, item_id=item_id, workspace=workspace)
     except onedrive_service.OneDriveError as e:
         raise HTTPException(status_code=400, detail=str(e))
     root_path, _, _ = project.onedrive_root_for(workspace)
+    # Graph itself paginates via opaque continuation tokens (not offset-
+    # based), so list_children already walks every page internally. We
+    # apply our own limit/offset on top of that full listing here — folder
+    # listings are bounded enough in practice that this is simpler than
+    # threading Graph's @odata.nextLink cursor through our own API.
+    total = len(items)
+    page_items = items[offset:offset + limit]
     return BrowseResponse(
         project_id=project.id,
         root_path=root_path,
-        items=[DriveItem(**i) for i in items],
+        items=[DriveItem(**i) for i in page_items],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

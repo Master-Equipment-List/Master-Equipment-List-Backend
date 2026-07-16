@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.deps import CurrentUser, DbSession, project_access
 from app.models import Project, ProjectMember, User
+from app.schemas.common import Page
 from app.schemas.project import (
     ProjectCreate,
     ProjectMemberAdd,
@@ -118,15 +119,19 @@ async def delete_project(
 
 # --- Members ---
 
-@router.get("/{project_id}/members", response_model=list[ProjectMemberOut])
+@router.get("/{project_id}/members", response_model=Page[ProjectMemberOut])
 async def list_members(
     db: DbSession,
     project: Project = Depends(project_access("viewer")),
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
 ):
+    stmt = select(ProjectMember).where(ProjectMember.project_id == project.id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     rows = (
-        await db.execute(select(ProjectMember).where(ProjectMember.project_id == project.id))
+        await db.execute(stmt.order_by(ProjectMember.id).limit(limit).offset(offset))
     ).scalars().all()
-    return rows
+    return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("/{project_id}/members", response_model=ProjectMemberOut, status_code=201)

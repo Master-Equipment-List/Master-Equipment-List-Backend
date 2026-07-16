@@ -1,6 +1,6 @@
 import io
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -9,15 +9,18 @@ from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import Select
 
 from app.deps import CurrentUser, DbSession, project_access
 from app.extractors.topside_excel import extract_equipment_rows
 from app.models import Equipment, EquipmentVersion, Project
+from app.schemas.common import Page
 from app.schemas.equipment import EquipmentCreate, EquipmentOut, EquipmentUpdate
 from app.services import audit_service
 from app.services.quantity import compute_installed_weight, pick_effective_total
@@ -26,18 +29,22 @@ from app.services.version_service import apply_update, record_initial_version
 router = APIRouter()
 
 
-@router.get("/projects/{project_id}/equipment", response_model=list[EquipmentOut])
-async def list_equipment(
-    db: DbSession,
-    project: Project = Depends(project_access("viewer")),
-    q: str | None = Query(None, description="Search by client tag, old tag, or description."),
-    workspace: str | None = Query(None, description="Filter by workspace: 'topside' or 'marine'. Omit to return all."),
+def _equipment_filter_stmt(
+    project_id: int,
+    *,
+    workspace: str | None = None,
+    q: str | None = None,
     module: str | None = None,
     equipment_type: str | None = None,
-    limit: int = Query(500, ge=1, le=5000),
-    offset: int = Query(0, ge=0),
-):
-    stmt = select(Equipment).where(Equipment.project_id == project.id)
+    min_version: int = 1,
+    updated_since_hours: int | None = None,
+) -> Select:
+    """Shared WHERE-clause builder for both the list endpoint (paginated
+    display) and the Excel export (exports every matching row regardless
+    of page) — keeps the two in sync so "export what you're filtering on"
+    is actually correct rather than relying on the client to enumerate ids.
+    """
+    stmt = select(Equipment).where(Equipment.project_id == project_id)
     if workspace:
         stmt = stmt.where(Equipment.workspace == workspace)
     if q:
@@ -51,8 +58,53 @@ async def list_equipment(
         stmt = stmt.where(Equipment.module == module)
     if equipment_type:
         stmt = stmt.where(Equipment.equipment_type == equipment_type)
-    stmt = stmt.order_by(Equipment.client_tag).limit(limit).offset(offset)
-    return (await db.execute(stmt)).scalars().all()
+    if min_version > 1:
+        stmt = stmt.where(Equipment.current_version >= min_version)
+    if updated_since_hours is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=updated_since_hours)
+        stmt = stmt.where(Equipment.updated_at >= cutoff)
+    return stmt
+
+
+_SORT_COLUMNS = {
+    "client_tag": Equipment.client_tag,
+    "current_version": Equipment.current_version,
+    "updated_at": Equipment.updated_at,
+}
+
+
+@router.get("/projects/{project_id}/equipment", response_model=Page[EquipmentOut])
+async def list_equipment(
+    db: DbSession,
+    project: Project = Depends(project_access("viewer")),
+    q: str | None = Query(None, description="Search by client tag, old tag, or description."),
+    workspace: str | None = Query(None, description="Filter by workspace: 'topside' or 'marine'. Omit to return all."),
+    module: str | None = None,
+    equipment_type: str | None = None,
+    min_version: int = Query(1, ge=1, description="Only rows with current_version >= this."),
+    updated_since_hours: int | None = Query(
+        None, ge=1, description="Only rows updated within the last N hours."
+    ),
+    sort_by: str = Query("client_tag", regex="^(client_tag|current_version|updated_at)$"),
+    sort_dir: str = Query("asc", regex="^(asc|desc)$"),
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    stmt = _equipment_filter_stmt(
+        project.id,
+        workspace=workspace, q=q, module=module, equipment_type=equipment_type,
+        min_version=min_version, updated_since_hours=updated_since_hours,
+    )
+
+    total = (
+        await db.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar_one()
+
+    col = _SORT_COLUMNS[sort_by]
+    order = col.desc() if sort_dir == "desc" else col.asc()
+    stmt = stmt.order_by(order).limit(limit).offset(offset)
+    rows = (await db.execute(stmt)).scalars().all()
+    return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("/projects/{project_id}/equipment", response_model=EquipmentOut, status_code=201)
@@ -407,12 +459,21 @@ def _document_no(project: Project, workspace: str) -> str:
 
 
 class ExportFilter(BaseModel):
-    """Optional payload for the Excel export. When ``ids`` is non-empty,
-    the export is restricted to those equipment rows — used by the UI to
-    export exactly what the table is currently showing after filters.
-    Empty or absent ``ids`` exports everything in the workspace.
+    """Optional payload for the Excel export.
+
+    ``ids`` (legacy): restrict to an explicit id set the frontend already
+    enumerated client-side.
+
+    The remaining fields mirror ``list_equipment``'s filters — used so the
+    UI can export "everything matching these filters" even though the
+    on-screen table itself is paginated (only one page of rows is ever
+    loaded client-side, so there's no full id list to send anymore).
+    When ``ids`` is given it wins; otherwise these filters apply.
     """
     ids: list[int] | None = None
+    q: str | None = None
+    min_version: int = 1
+    updated_since_hours: int | None = None
 
 
 @router.post("/projects/{project_id}/export/excel")
@@ -445,14 +506,23 @@ async def export_excel(
     The body is optional; calling with no body exports everything in
     the (project, workspace) scope.
     """
-    stmt = select(Equipment).where(Equipment.project_id == project.id)
-    if workspace:
-        stmt = stmt.where(Equipment.workspace == workspace)
     if body and body.ids:
         # Restrict to the explicit ID set the frontend sent. We keep the
         # project + workspace filter on top so a user can't smuggle in IDs
         # they don't have access to via project_access().
-        stmt = stmt.where(Equipment.id.in_(body.ids))
+        stmt = select(Equipment).where(
+            Equipment.project_id == project.id, Equipment.id.in_(body.ids)
+        )
+        if workspace:
+            stmt = stmt.where(Equipment.workspace == workspace)
+    else:
+        stmt = _equipment_filter_stmt(
+            project.id,
+            workspace=workspace,
+            q=body.q if body else None,
+            min_version=body.min_version if body else 1,
+            updated_since_hours=body.updated_since_hours if body else None,
+        )
     # Sort by module first so we can drop a banner row at the start of
     # each group, then by client_tag inside each module — same order
     # the reference workbook uses.

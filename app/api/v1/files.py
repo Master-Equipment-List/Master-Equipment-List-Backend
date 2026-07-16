@@ -2,24 +2,27 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.deps import CurrentUser, DbSession, project_access
 from app.models import FileExtraction, Project, ProjectFile
+from app.schemas.common import Page
 from app.schemas.file import ExtractionOut, FileOut, FileWithExtractionOut
 from app.services import audit_service
 
 router = APIRouter()
 
 
-@router.get("/projects/{project_id}/files", response_model=list[FileOut])
+@router.get("/projects/{project_id}/files", response_model=Page[FileOut])
 async def list_files(
     db: DbSession,
     project: Project = Depends(project_access("viewer")),
     category: str | None = Query(None, description="Filter by folder category (e.g. 'PFD Samples')."),
     extension: str | None = Query(None, description="Filter by file extension, e.g. '.pdf'."),
     workspace: str | None = Query(None, description="Filter by workspace: 'topside' or 'marine'."),
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
 ):
     stmt = select(ProjectFile).where(ProjectFile.project_id == project.id)
     if workspace:
@@ -28,8 +31,11 @@ async def list_files(
         stmt = stmt.where(ProjectFile.folder_category == category)
     if extension:
         stmt = stmt.where(ProjectFile.extension == extension.lower())
-    stmt = stmt.order_by(ProjectFile.name)
-    return (await db.execute(stmt)).scalars().all()
+
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    stmt = stmt.order_by(ProjectFile.name).limit(limit).offset(offset)
+    rows = (await db.execute(stmt)).scalars().all()
+    return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/projects/{project_id}/files/{file_id}", response_model=FileWithExtractionOut)

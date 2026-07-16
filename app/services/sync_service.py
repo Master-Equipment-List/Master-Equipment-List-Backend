@@ -30,7 +30,7 @@ from app.models import (
 )
 from app.parsers import parse_file
 from app.services import audit_service, onedrive_service
-from app.services.version_service import apply_update
+from app.services.pending_change_service import queue_pending_change
 
 
 log = logging.getLogger(__name__)
@@ -240,20 +240,26 @@ async def _apply_pfd_updates(
     user_id: int | None,
     summary: dict[str, Any] | None = None,
 ) -> int:
-    """Apply PFD updates to every matching equipment row, AND auto-create
-    rows for any tags the PFD reports that don't exist yet in the project.
+    """Queue PFD updates for admin review on every matching equipment row,
+    AND auto-create rows for any tags the PFD reports that don't exist yet
+    in the project.
 
     Reuses the raw vision JSON already on ``extraction.data["vision_pages"]``
     and feeds it to the LLM mapper to pull every equipment tag in the
     header band plus the seven target MEL fields per tag. For each entry:
 
-      * Matching equipment found  → ``apply_update`` (new version snapshot).
+      * Matching equipment found  → ``queue_pending_change`` (admin reviews
+                                    old vs new per field before anything
+                                    is written; NOT applied immediately).
       * No match                  → ``create_equipment_from_sync`` (new row +
-                                    initial v1 snapshot stamped source="pfd").
+                                    initial v1 snapshot stamped source="pfd",
+                                    still auto-created — nothing existing to
+                                    overwrite).
 
-    Returns the number of equipment rows touched (updated + created). When
-    a ``summary`` dict is passed, it's mutated to record creation counts
-    separately under ``equipment_created`` for visibility in the response.
+    Returns the number of equipment rows touched (queued for review +
+    created). When a ``summary`` dict is passed, it's mutated to record
+    creation counts under ``equipment_created`` and queued-review counts
+    under ``pending_changes_queued``.
     """
     from app.services import pfd_field_mapper
     from app.services.equipment_create_helper import create_equipment_from_sync
@@ -291,20 +297,22 @@ async def _apply_pfd_updates(
         if eq:
             # If this row is locked by a higher-priority source (P&ID),
             # count the skip explicitly so the user sees it in the summary.
+            # Don't even queue a proposal for review in that case.
             blocked_by = await _has_higher_priority_source(db, eq.id, "pfd")
             if blocked_by:
                 if summary is not None:
                     summary["pid_locked_skips"] = (summary.get("pid_locked_skips") or 0) + 1
                 continue
-            v = await apply_update(
+            pc = await queue_pending_change(
                 db, eq, fields,
                 source="pfd",
                 source_file_id=file.id,
                 user_id=user_id,
-                note=f"PFD update from {file.name}",
             )
-            if v:
+            if pc:
                 affected += 1
+                if summary is not None:
+                    summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         else:
             await create_equipment_from_sync(
                 db, project.id, tag.strip(), fields,
@@ -327,8 +335,9 @@ async def _apply_pid_updates(
     user_id: int | None,
     summary: dict[str, Any] | None = None,
 ) -> int:
-    """Apply P&ID updates to every matching equipment row, AND auto-create
-    rows for any tags the P&ID names that don't exist yet in the project.
+    """Queue P&ID updates for admin review on every matching equipment row,
+    AND auto-create rows for any tags the P&ID names that don't exist yet
+    in the project.
 
     Mirrors ``_apply_pfd_updates``'s shape but stamps source="pid". P&ID
     is the HIGHEST-priority source in the precedence ladder
@@ -337,9 +346,10 @@ async def _apply_pid_updates(
     by ``_has_higher_priority_source`` — which means P&ID itself never
     needs to consult that check.
 
-    Returns the number of equipment rows touched (updated + created).
-    When a ``summary`` dict is passed, it's mutated to record creation
-    counts under ``equipment_created``.
+    Returns the number of equipment rows touched (queued for review +
+    created). When a ``summary`` dict is passed, it's mutated to record
+    creation counts under ``equipment_created`` and queued-review counts
+    under ``pending_changes_queued``.
     """
     from app.services import pid_field_mapper
     from app.services.equipment_create_helper import create_equipment_from_sync
@@ -372,15 +382,16 @@ async def _apply_pid_updates(
             continue
         eq = _find_equipment_in_map(eq_map, tag)
         if eq:
-            v = await apply_update(
+            pc = await queue_pending_change(
                 db, eq, fields,
                 source="pid",
                 source_file_id=file.id,
                 user_id=user_id,
-                note=f"P&ID update from {file.name}",
             )
-            if v:
+            if pc:
                 affected += 1
+                if summary is not None:
+                    summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
         else:
             await create_equipment_from_sync(
                 db, project.id, tag.strip(), fields,
@@ -403,8 +414,8 @@ async def _apply_vendor_updates(
     user_id: int | None,
     summary: dict[str, Any] | None = None,
 ) -> int:
-    """Apply vendor-data updates to the matching equipment row, OR
-    auto-create the row if no match exists yet.
+    """Queue vendor-data updates for admin review on the matching
+    equipment row, OR auto-create the row if no match exists yet.
 
     The vendor mapper now returns 15 fields per sheet (8 numerics + 7
     context fields like ``description``, ``vendor``, ``material``,
@@ -468,14 +479,15 @@ async def _apply_vendor_updates(
             if summary is not None:
                 summary["pid_locked_skips"] = (summary.get("pid_locked_skips") or 0) + 1
             return 0
-        v = await apply_update(
+        pc = await queue_pending_change(
             db, eq, fields,
             source="vendor",
             source_file_id=file.id,
             user_id=user_id,
-            note=f"Vendor data update from {file.name}",
         )
-        return 1 if v else 0
+        if pc and summary is not None:
+            summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
+        return 1 if pc else 0
     else:
         await create_equipment_from_sync(
             db, project.id, tag.strip(), fields,
@@ -487,6 +499,88 @@ async def _apply_vendor_updates(
         if summary is not None:
             summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
         return 1
+
+
+async def _apply_equipment_list_updates(
+    db: AsyncSession,
+    project: Project,
+    file: ProjectFile,
+    user_id: int | None,
+    workspace: str,
+    summary: dict[str, Any] | None = None,
+) -> int:
+    """Auto-detect and import an Equipment List Excel file synced via
+    OneDrive — no folder-category is required for this, unlike PFD/P&ID/
+    Vendor. ANY synced ``.xlsx``/``.xlsm`` is tried through the same
+    row-parser the manual "Import Equipment List" page uses
+    (``topside_excel.extract_equipment_rows``); if it doesn't find a
+    recognizable client-tag column, this quietly returns 0 — most synced
+    Excel files are NOT equipment lists (title blocks, calc sheets, etc.),
+    and that's expected, not an error.
+
+    Unlike the manual import's "update_existing" mode, an existing tag's
+    changes are NOT applied immediately — they're queued via
+    ``queue_pending_change`` for admin review (old vs new per field). A
+    tag not seen yet still gets created immediately via
+    ``create_equipment_from_sync`` — nothing existing to overwrite there.
+    """
+    from app.extractors.topside_excel import extract_equipment_rows
+    from app.services.equipment_create_helper import create_equipment_from_sync
+    from app.services.version_service import TRACKED_FIELDS
+
+    try:
+        rows = extract_equipment_rows(file.local_path)
+    except Exception as e:  # noqa: BLE001
+        log.info("Equipment-list auto-import: %s doesn't parse as one (%s)", file.name, e)
+        return 0
+    if not rows:
+        return 0
+
+    eq_map = await _load_equipment_map(db, project.id, workspace=workspace)
+
+    seen_in_file: set[str] = set()
+    affected = 0
+    for row in rows:
+        tag = (row.get("client_tag") or "").strip()
+        if not tag:
+            continue
+        norm = normalize_tag(tag)
+        if norm in seen_in_file:
+            continue  # duplicate tag within this file — keep the first occurrence
+        seen_in_file.add(norm)
+
+        fields = {
+            k: v for k, v in row.items()
+            if k not in ("client_tag", "__raw") and k in TRACKED_FIELDS and v
+        }
+        if not fields:
+            continue
+
+        eq = _find_equipment_in_map(eq_map, tag)
+        if eq:
+            pc = await queue_pending_change(
+                db, eq, fields,
+                source="excel",
+                source_file_id=file.id,
+                user_id=user_id,
+            )
+            if pc:
+                affected += 1
+                if summary is not None:
+                    summary["pending_changes_queued"] = (summary.get("pending_changes_queued") or 0) + 1
+        else:
+            new_eq = await create_equipment_from_sync(
+                db, project.id, tag, fields,
+                source="excel",
+                source_file_id=file.id,
+                user_id=user_id,
+                workspace=workspace,
+            )
+            eq_map[normalize_tag(tag)] = new_eq
+            affected += 1
+            if summary is not None:
+                summary["equipment_created"] = (summary.get("equipment_created") or 0) + 1
+    return affected
 
 
 async def _load_equipment_map(
@@ -675,6 +769,16 @@ async def _process_drive_items(
                     db, project, pf, ext, user_id, summary
                 )
 
+            # Equipment List auto-detect is folder-independent — try it for
+            # every synced Excel file regardless of category (unlike
+            # PFD/P&ID/Vendor above, which are gated on folder placement).
+            if pf.extension in (".xlsx", ".xlsm"):
+                summary["equipment_list_updates_applied"] = (
+                    summary.get("equipment_list_updates_applied") or 0
+                ) + await _apply_equipment_list_updates(
+                    db, project, pf, user_id, workspace, summary
+                )
+
             summary["files_synced"] += 1
 
         except Exception as e:  # noqa: BLE001
@@ -707,6 +811,12 @@ async def run_sync(
         "pfd_updates_applied": 0,
         "pid_updates_applied": 0,
         "vendor_updates_applied": 0,
+        "equipment_list_updates_applied": 0,
+        # Existing-row updates from PFD/P&ID/Vendor/Excel are no longer
+        # applied immediately — they're queued here for admin review
+        # (see EquipmentPendingChange). New equipment (tags not seen
+        # before) still auto-creates and is NOT part of this count.
+        "pending_changes_queued": 0,
         "equipment_created": 0,
         # Updates that were silently skipped because a higher-priority
         # source (P&ID) had already set the row. Helps users understand
@@ -765,6 +875,12 @@ async def sync_single_item(
         "pfd_updates_applied": 0,
         "pid_updates_applied": 0,
         "vendor_updates_applied": 0,
+        "equipment_list_updates_applied": 0,
+        # Existing-row updates from PFD/P&ID/Vendor/Excel are no longer
+        # applied immediately — they're queued here for admin review
+        # (see EquipmentPendingChange). New equipment (tags not seen
+        # before) still auto-creates and is NOT part of this count.
+        "pending_changes_queued": 0,
         "equipment_created": 0,
         # Updates that were silently skipped because a higher-priority
         # source (P&ID) had already set the row. Helps users understand

@@ -134,6 +134,63 @@ async def get_valid_token(db: AsyncSession) -> str:
     return tok.access_token
 
 
+async def _fetch_account_email(access_token: str) -> str | None:
+    """Best-effort lookup of the connected account's email via Graph /me.
+
+    Called right after token exchange so the admin page can show WHO is
+    connected, not just that a token exists. Never raises — a failure here
+    shouldn't block the OAuth flow, it just leaves account_email unset.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{GRAPH_BASE}/me?$select=mail,userPrincipalName",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("mail") or data.get("userPrincipalName")
+    except Exception:
+        return None
+
+
+async def verify_connection(db: AsyncSession) -> dict[str, Any]:
+    """Report the OneDrive connection's REAL state, not just the stored
+    access token's timestamp.
+
+    Access tokens are short-lived (~60-90 min) by design, so ``expires_at``
+    being in the past is normal whenever no sync has run recently — it does
+    NOT mean the connection is broken. This runs the same refresh path a
+    real sync would use (``get_valid_token``): if the refresh token is
+    still good, the token is silently renewed and ``token_valid`` is True.
+    Only a genuinely dead refresh token (revoked, expired, policy change)
+    reports ``token_valid: False`` with the underlying error.
+    """
+    tok = (
+        await db.execute(select(OneDriveToken).where(OneDriveToken.tenant_id == settings.MS_TENANT_ID))
+    ).scalar_one_or_none()
+    if not tok:
+        return {"connected": False}
+
+    error: str | None = None
+    try:
+        await get_valid_token(db)
+    except OneDriveError as e:
+        error = str(e)
+
+    return {
+        "connected": True,
+        "account_email": tok.account_email,
+        "tenant_id": tok.tenant_id,
+        "expires_at": tok.expires_at,
+        "scope": tok.scope,
+        "has_refresh_token": bool(tok.refresh_token),
+        "token_valid": error is None,
+        "error": error,
+    }
+
+
 def _ensure_within_root(project: Project, item_path: str) -> None:
     """Reject any path outside the project's configured OneDrive root."""
     root = project.onedrive_root_path or ""
