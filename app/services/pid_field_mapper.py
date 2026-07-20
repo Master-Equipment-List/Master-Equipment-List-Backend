@@ -17,6 +17,9 @@ better than a PFD:
   - orientation     sometimes spelled out, otherwise inferable from elevation views
   - insulation      type/thickness if printed
   - p_id            the P&ID document ID itself (so equipment row gets a back-link)
+  - module          module/train code the equipment sits in, if labelled on the
+                    drawing (e.g. a "MODULE-M25A" callout near the equipment
+                    becomes "M25A" — see field notes below)
 
 We also collect ancillary metadata that DOESN'T fit on the equipment row
 but is useful for the file viewer / future Line+Instrument registers:
@@ -45,6 +48,7 @@ Output shape:
         "design_code":     str|null,
         "orientation":     str|null,
         "pid":             str|null,
+        "module":          str|null,
       },
       "nozzles": [{"id": "N1", "size": "12\"", "rating": "300#", "service": "INLET"}, ...]
     },
@@ -80,6 +84,7 @@ TARGET_FIELDS = [
     "design_code",
     "orientation",
     "pid",
+    "module",
 ]
 
 
@@ -127,6 +132,13 @@ A P&ID covers one or a small number of equipment items in detail. Identify:
    - pid             the document ID of THIS P&ID drawing itself (read it
                      from the title block contractor doc ID). The same value
                      applies to every equipment on this sheet.
+   - module          the module/train code the equipment is located in, if
+                     labelled on the drawing (e.g. a diagram title or callout
+                     reading "MODULE-M25A", "MODULE M40A"). Strip the
+                     "MODULE"/"MODULE-" prefix and any separator — report
+                     just the bare code, e.g. "M25A". If several modules are
+                     labelled on the sheet, pick the one nearest this
+                     equipment's tag/symbol, not just the first one seen.
 
 3. Also collect (as ancillary info, ONE level — not per-equipment):
 
@@ -162,7 +174,8 @@ Return ONLY this JSON object — no markdown fences, no commentary:
         "configuration":   <string or null>,
         "design_code":     <string or null>,
         "orientation":     <string or null>,
-        "pid":             <string or null>
+        "pid":             <string or null>,
+        "module":          <string or null>
       }},
       "nozzles": [
         {{"id": <string>, "size": <string>, "rating": <string>, "service": <string>}}

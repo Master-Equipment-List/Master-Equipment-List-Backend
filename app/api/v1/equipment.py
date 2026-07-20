@@ -19,9 +19,10 @@ from sqlalchemy.sql import Select
 
 from app.deps import CurrentUser, DbSession, project_access
 from app.extractors.topside_excel import extract_equipment_rows
-from app.models import Equipment, EquipmentVersion, Project
+from app.models import DuplicateDismissal, Equipment, EquipmentVersion, Project
 from app.schemas.common import Page
 from app.schemas.equipment import (
+    DismissDuplicateRequest,
     DuplicatePairOut,
     EquipmentCreate,
     EquipmentOut,
@@ -136,13 +137,29 @@ async def duplicate_audit(
     intentionally-identical spare/redundant units across different
     trains/modules, not data-entry mistakes; that's expected, this is a
     review tool, nothing here is applied automatically.
+
+    Pairs previously marked "not a duplicate" (see the dismiss endpoint
+    below) are excluded — the scan itself has no memory, so without this
+    filter every dismissed pair would just reappear on the next load.
     """
     stmt = select(Equipment).where(Equipment.project_id == project.id)
     if workspace:
         stmt = stmt.where(Equipment.workspace == workspace)
     rows = (await db.execute(stmt)).scalars().all()
 
-    pairs = find_all_duplicate_pairs(rows)
+    dismissed_rows = (
+        await db.execute(
+            select(DuplicateDismissal.equipment_low_id, DuplicateDismissal.equipment_high_id)
+            .where(DuplicateDismissal.project_id == project.id)
+        )
+    ).all()
+    dismissed_pairs = {(low, high) for low, high in dismissed_rows}
+
+    all_pairs = find_all_duplicate_pairs(rows)
+    pairs = [
+        p for p in all_pairs
+        if (min(p.a.id, p.b.id), max(p.a.id, p.b.id)) not in dismissed_pairs
+    ]
     total = len(pairs)
     page_pairs = pairs[offset:offset + limit]
     return Page(
@@ -156,6 +173,51 @@ async def duplicate_audit(
         ],
         total=total, limit=limit, offset=offset,
     )
+
+
+@router.post("/projects/{project_id}/equipment/duplicate-audit/dismiss", status_code=204)
+async def dismiss_duplicate_pair(
+    payload: DismissDuplicateRequest,
+    db: DbSession,
+    user: CurrentUser,
+    project: Project = Depends(project_access("viewer")),
+):
+    """Mark a candidate pair from the duplicate audit as "not a duplicate"
+    so it stops reappearing on future scans. Available to anyone who can
+    view the audit (matches the button's visibility) — this is a triage
+    decision, not a destructive one; unlike merge, it doesn't touch
+    Equipment rows at all and there's nothing here for an admin to gate.
+    """
+    if payload.equipment_a_id == payload.equipment_b_id:
+        raise HTTPException(400, "equipment_a_id and equipment_b_id must differ")
+
+    low_id = min(payload.equipment_a_id, payload.equipment_b_id)
+    high_id = max(payload.equipment_a_id, payload.equipment_b_id)
+
+    existing = (
+        await db.execute(
+            select(DuplicateDismissal).where(
+                DuplicateDismissal.project_id == project.id,
+                DuplicateDismissal.equipment_low_id == low_id,
+                DuplicateDismissal.equipment_high_id == high_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return
+
+    low_equipment = await db.get(Equipment, low_id)
+    if not low_equipment or low_equipment.project_id != project.id:
+        raise HTTPException(404, "Equipment not found in this project")
+
+    db.add(DuplicateDismissal(
+        project_id=project.id,
+        workspace=low_equipment.workspace,
+        equipment_low_id=low_id,
+        equipment_high_id=high_id,
+        dismissed_by_id=user.id,
+    ))
+    await db.commit()
 
 
 @router.post(

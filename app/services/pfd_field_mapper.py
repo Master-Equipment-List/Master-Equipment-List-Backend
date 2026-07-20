@@ -17,6 +17,7 @@ requirement, not a layout assumption):
   - design_press        (design pressure barg)
   - design_temp         (design temperature °C)
   - material            (material of construction)
+  - module              (module/train code, if labelled — see field notes below)
 
 Values are strings (the equipment columns are TEXT in the DB so ranges
 like ``"0.1 / 3.5"``, ``"FV / 10"``, ``"(-)40/120"`` survive). Missing
@@ -46,6 +47,7 @@ TARGET_FIELDS = [
     "design_press",
     "design_temp",
     "material",
+    "module",
 ]
 
 
@@ -94,6 +96,13 @@ From the vision JSON, find:
    - design_press    (just the pressure portion of DESIGN; preserve "FV / 10")
    - design_temp     (just the temperature portion of DESIGN; preserve "(-)40 / 120")
    - material        (MATERIAL row text)
+   - module          the module/train code the equipment is located in, if
+                     labelled on the drawing (e.g. a diagram title or callout
+                     reading "MODULE-M25A", "MODULE M40A"). Strip the
+                     "MODULE"/"MODULE-" prefix and any separator — report
+                     just the bare code, e.g. "M25A". If several modules are
+                     labelled on the sheet, pick the one nearest this
+                     equipment's column/tag, not just the first one seen.
 
 Rules:
 - Preserve ranges and original punctuation exactly. "0.1 / 3.5" is more
@@ -116,7 +125,8 @@ Return ONLY this JSON object — no markdown fences, no commentary:
         "operating_temp":  <string or null>,
         "design_press":    <string or null>,
         "design_temp":     <string or null>,
-        "material":        <string or null>
+        "material":        <string or null>,
+        "module":          <string or null>
       }}
     }},
     ...

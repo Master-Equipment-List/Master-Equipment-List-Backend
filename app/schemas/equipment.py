@@ -117,6 +117,11 @@ class DuplicatePairOut(BaseModel):
     type_similarity: float
 
 
+class DismissDuplicateRequest(BaseModel):
+    equipment_a_id: int
+    equipment_b_id: int
+
+
 class MergeEquipmentRequest(BaseModel):
     # TRACKED_FIELDS names to pull from the row being removed onto the row
     # being kept. Fields not listed keep the kept row's existing value.
