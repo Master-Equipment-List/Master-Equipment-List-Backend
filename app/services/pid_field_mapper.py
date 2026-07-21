@@ -117,7 +117,14 @@ A P&ID covers one or a small number of equipment items in detail. Identify:
    explicitly stated anywhere in the JSON. Set to null otherwise:
 
    - description     short equipment description (typically from the title
-                     block, e.g. "HP FLARE KNOCK OUT DRUM")
+                     block, e.g. "HP FLARE KNOCK OUT DRUM"). These often
+                     start with a short plant/skid abbreviation (e.g.
+                     "COPT", "WBPT") that's easy to misread letter-by-letter
+                     in small print — a stylized "O" is easy to confuse with
+                     "D" or "G". Cross-check against every occurrence of the
+                     same abbreviation elsewhere in the JSON (it usually
+                     repeats across multiple tiles/pages) and prefer the
+                     reading that's consistent across occurrences.
    - material        material of construction (e.g. "LTCS + SS CLAD", "DSS",
                      "ASTM A516 Gr 70 + SS316L cladding")
    - operating_press operating pressure as printed (preserve ranges:
@@ -240,9 +247,16 @@ def map_pid_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | None:
         log.warning("anthropic SDK not installed; P&ID field mapping disabled")
         return None
     try:
-        resp = client.messages.create(
+        # A P&ID sheet listing many equipment items (an "AS BUILT" conversion
+        # drawing, say) needs ~10 fields written out per tag plus line/
+        # instrument tag lists — comfortably over 6144 tokens for a busy
+        # sheet, and a truncated response fails to parse and silently
+        # collapses to "no equipment found" with no error recorded anywhere.
+        # Streaming lets us raise the ceiling well past what the SDK allows
+        # for a single non-streaming call.
+        with client.messages.stream(
             model=settings.VISION_MODEL,
-            max_tokens=6144,
+            max_tokens=16000,
             temperature=0,
             system=[{
                 "type": "text",
@@ -253,13 +267,21 @@ def map_pid_fields(vision_pages: list[dict[str, Any]]) -> dict[str, Any] | None:
                 "role": "user",
                 "content": [{"type": "text", "text": _build_user_prompt(payload)}],
             }],
-        )
+        ) as stream:
+            resp = stream.get_final_message()
     except Exception as e:  # noqa: BLE001
         log.warning("P&ID field mapper call failed: %s", e)
         return None
 
     text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-    parsed = _parse_json(text) or {}
+    parsed = _parse_json(text)
+    if parsed is None:
+        log.warning(
+            "P&ID field mapper: response failed to parse as JSON (stop_reason=%s, %d chars) — "
+            "treating as no equipment found, but this may be truncation, not an empty sheet",
+            getattr(resp, "stop_reason", None), len(text),
+        )
+        parsed = {}
 
     out_equipment: list[dict[str, Any]] = []
     for entry in (parsed.get("equipment") or []):

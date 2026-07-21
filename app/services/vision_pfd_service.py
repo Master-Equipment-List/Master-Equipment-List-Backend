@@ -204,9 +204,18 @@ def _call_claude_on_image(img, label: str) -> dict[str, Any]:
         },
     }
     try:
-        resp = client.messages.create(
+        # Dense pages — an "AS BUILT" conversion P&ID packing 6-8 full
+        # equipment spec rows into one table, say — can need well over
+        # 16,000 tokens of JSON output; cut off mid-object it fails to
+        # parse and silently drops every tag on that page. Billing is by
+        # tokens actually generated, so a higher ceiling costs nothing on
+        # pages that already finish comfortably under it. The Anthropic
+        # SDK requires streaming once max_tokens implies a long-running
+        # response (non-streaming raises above ~16-20k here), so this uses
+        # the streaming API to go higher without hitting that guard.
+        with client.messages.stream(
             model=settings.VISION_MODEL,
-            max_tokens=8192,
+            max_tokens=32000,
             temperature=0,
             system=[{
                 "type": "text",
@@ -220,7 +229,8 @@ def _call_claude_on_image(img, label: str) -> dict[str, Any]:
                     {"type": "text", "text": GENERIC_USER_PROMPT},
                 ],
             }],
-        )
+        ) as stream:
+            resp = stream.get_final_message()
     except Exception as e:  # noqa: BLE001
         log.warning("Anthropic vision call failed for %s: %s", label, e)
         return {"_label": label, "_extraction_error": f"api_call_failed: {e}"}

@@ -485,6 +485,7 @@ async def _apply_vendor_updates(
         created = await _create_or_flag_duplicate(
             db, project, file, eq_map, tag, fields,
             source="vendor", user_id=user_id, workspace=file.workspace, summary=summary,
+            equipment_type=mapping.get("equipment_type_detected"),
         )
         return 1 if created else 0
 
@@ -619,6 +620,7 @@ async def _create_or_flag_duplicate(
     user_id: int | None,
     workspace: str,
     summary: dict[str, Any] | None,
+    equipment_type: str | None = None,
 ) -> Equipment | None:
     """A tag not found by exact/fuzzy TAG match — before blindly creating a
     new equipment row, check whether an EXISTING row's description +
@@ -628,6 +630,14 @@ async def _create_or_flag_duplicate(
     silently creating a probable duplicate; the admin decides whether it's
     genuinely new or the same thing under the existing tag.
 
+    ``equipment_type`` is the mapper's own best read of the equipment's
+    type when it has one (e.g. the vendor mapper's ``equipment_type_detected``,
+    which lives OUTSIDE ``fields`` since it's never written to the equipment
+    row itself). PFD/P&ID have no such signal and pass ``None``, in which
+    case ``find_duplicate_candidate`` falls back to guessing from the tag
+    prefix. ``fields`` itself never has an "equipment_type" key — that was
+    a latent bug (silently always None) fixed by adding this parameter.
+
     Returns the newly-created Equipment, or ``None`` if a duplicate was
     flagged instead (nothing created in that case).
     """
@@ -636,7 +646,7 @@ async def _create_or_flag_duplicate(
     candidate = find_duplicate_candidate(
         eq_map.values(),
         description=fields.get("description"),
-        equipment_type=fields.get("equipment_type"),
+        equipment_type=equipment_type,
         incoming_tag=tag,
     )
     if candidate:
